@@ -2002,16 +2002,19 @@ def _set_session_context(
         # it instead of falling back to the gateway launch dir.
         resolved = cwd if cwd is not None else _cwd_for_session_key(session_key)
         source = _resolve_session_platform()
+        hermes_user_id = ""
         with _sessions_lock:
             for sess in list(_sessions.values()):
                 if sess.get("session_key") == session_key:
                     source = _session_source(sess)
+                    hermes_user_id = str(sess.get("hermes_user_id") or "")
                     break
         return set_session_vars(
             session_key=session_key,
             source=source,
             cwd=resolved,
             ui_session_id=ui_session_id,
+            user_id=hermes_user_id,
         )
     except Exception:
         return []
@@ -5209,6 +5212,12 @@ def _(rid, params: dict) -> dict:
     cols = int(params.get("cols", 80))
     history = _coerce_seed_history(params.get("messages"))
     title = str(params.get("title") or "").strip()
+    # End-user id forwarded by the calling backend (see
+    # hermes-userid-mcp-patch.md) — kept on the session so every turn can
+    # re-bind HERMES_SESSION_USER_ID via _set_session_context, mirroring how
+    # `source`/`cwd` are threaded through. Not authenticated by Hermes itself;
+    # the caller is trusted to have verified it upstream.
+    hermes_user_id = str(params.get("user_id") or "").strip()
     # When set, this is a branch: the new chat copies an existing conversation's
     # history and links back to it so list_sessions_rich keeps it visible and the
     # sidebar can nest it under its parent. Mirrors the TUI /branch marker.
@@ -5293,6 +5302,7 @@ def _(rid, params: dict) -> dict:
             "session_key": key,
             "show_reasoning": _load_show_reasoning(),
             "source": source,
+            "hermes_user_id": hermes_user_id,
             "slash_worker": None,
             "tool_progress_mode": _load_tool_progress_mode(),
             "tool_started_at": {},
