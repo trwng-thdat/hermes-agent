@@ -310,6 +310,31 @@ TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "without acting are not acceptable."
 )
 
+# Knowledge-first ordering for information lookups. Qualifies the blanket
+# "use your tools" steer above: for a QUESTION that seeks information, the
+# first tool must be a knowledge/read/search tool, not an external/action one.
+KNOWLEDGE_FIRST_GUIDANCE = (
+    "# Knowledge-first for lookups\n"
+    "Classify each request first:\n"
+    "- LOOKUP — the user wants to KNOW something (a fact, number, price, record, "
+    "list, or document) or mentions/asks about any entity, product, or item, even "
+    "when phrased casually as a request. Your FIRST tool call MUST be a knowledge/"
+    "read/search tool over the internal knowledge base. Do NOT open with any other "
+    "tool for a lookup.\n"
+    "- ACTION — the user tells you to DO or CHANGE something in a system (send, "
+    "create, add, move, update, schedule, delete). Use the matching tool directly.\n"
+    "- OTHERWISE (writing, translating, brainstorming, greetings, capability "
+    "questions): answer directly.\n"
+    "When unsure between LOOKUP and ACTION, treat it as a LOOKUP unless there is a "
+    "clear verb that mutates a system. For a LOOKUP, reach for a non-knowledge tool "
+    "ONLY (a) when the user explicitly asks for a live record, or (b) after the "
+    "knowledge base genuinely has nothing. A tool's empty / not-found / zero result "
+    "is NEVER the answer if you have not read the knowledge base — read it before "
+    "concluding, and re-read it when the user re-asks; never rely on a failed tool "
+    "attempt from an earlier turn. This overrides the general 'use your tools' "
+    "enforcement for lookups; it does not block acting on an explicit action request."
+)
+
 # Model name substrings that trigger tool-use enforcement guidance.
 # Add new patterns here when a model family needs explicit steering.
 TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok", "glm", "qwen", "deepseek")
