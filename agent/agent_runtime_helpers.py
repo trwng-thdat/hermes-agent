@@ -2508,6 +2508,16 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 ),
                 next_args,
             )
+    elif function_name == "clarify_form":
+        def _execute(next_args: dict) -> Any:
+            from tools.clarify_form_tool import clarify_form_tool as _clarify_form_tool
+            return _finish_agent_tool(
+                _clarify_form_tool(
+                    questions=next_args.get("questions"),
+                    callback=getattr(agent, "clarify_form_callback", None),
+                ),
+                next_args,
+            )
     elif function_name == "read_terminal":
         def _execute(next_args: dict) -> Any:
             from tools.read_terminal_tool import read_terminal_tool as _read_terminal_tool

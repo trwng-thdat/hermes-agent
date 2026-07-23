@@ -4524,6 +4524,9 @@ def _agent_cbs(sid: str) -> dict:
         "clarify_callback": lambda q, c: _block(
             "clarify.request", sid, {"question": q, "choices": c}
         ),
+        "clarify_form_callback": lambda questions: _block(
+            "clarify_form.request", sid, {"questions": questions}
+        ),
         # read_terminal tool (desktop GUI): same blocking bridge as clarify — the
         # renderer answers terminal.read.respond with the serialized buffer.
         "read_terminal_callback": lambda start=None, count=None: _block(
@@ -11756,6 +11759,11 @@ def _respond(rid, params, key, *, allow_expired=False):
 @method("clarify.respond")
 def _(rid, params: dict) -> dict:
     return _respond(rid, params, "answer")
+
+
+@method("clarify_form.respond")
+def _(rid, params: dict) -> dict:
+    return _respond(rid, params, "answers")
 
 
 @method("terminal.read.respond")
