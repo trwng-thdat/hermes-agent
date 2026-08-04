@@ -1869,6 +1869,12 @@ def compress_context(
             agent.session_id or "none", _pre_msg_count, len(compressed),
             f"{_compressed_est:,}",
         )
+        _emit_compression_attempt_telemetry(
+            agent,
+            started_at=_attempt_started_at,
+            commit_status="committed",
+            split_status="not_applicable",
+        )
         # Emit an explicit terminal state for UI clients. The existing
         # COMPACTION_STATUS lifecycle event marks the start; without a matching
         # completion event, dashboard clients can only show a spinner until the
