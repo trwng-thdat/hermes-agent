@@ -2191,6 +2191,7 @@ class TestAgentRuntimePostHookOwnershipSync:
         ("session_search", {"query": "needle"}),
         ("memory", {"action": "view", "target": "memory"}),
         ("clarify", {"question": "Continue?"}),
+        ("clarify_form", {"questions": [{"text": "Continue?"}]}),
         ("read_terminal", {}),
         ("delegate_task", {"goal": "Check the child path"}),
     )
@@ -2221,6 +2222,10 @@ class TestAgentRuntimePostHookOwnershipSync:
         )
         monkeypatch.setattr(
             "tools.memory_tool.memory_tool",
+            lambda **kwargs: '{"ok":true}',
+        )
+        monkeypatch.setattr(
+            "tools.clarify_form_tool.clarify_form_tool",
             lambda **kwargs: '{"ok":true}',
         )
         monkeypatch.setattr(

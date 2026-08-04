@@ -141,6 +141,9 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     monkeypatch.setattr(system_prompt, "DEFAULT_AGENT_IDENTITY", "IDENTITY")
     monkeypatch.setattr(system_prompt, "HERMES_AGENT_HELP_GUIDANCE", "HELP")
     monkeypatch.setattr(system_prompt, "STEER_CHANNEL_NOTE", "STEER")
+    # Fork behavior: the knowledge-first block is appended for any session that
+    # has tools. Stub it so this test asserts ORDER, not the guidance's wording.
+    monkeypatch.setattr(system_prompt, "KNOWLEDGE_FIRST_GUIDANCE", "KNOWLEDGE_FIRST")
     monkeypatch.setattr(system_prompt, "get_hermes_home", lambda: Path("/hermes"))
 
     expected_profile = (
@@ -152,8 +155,10 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     )
     expected = "\n\n".join((
         "IDENTITY",
-        "HELP",
+        # No "HELP": the fork gates HERMES_AGENT_HELP_GUIDANCE on skill_view
+        # being loaded, and this agent's toolset is read_file only.
         "STEER",
+        "KNOWLEDGE_FIRST",
         "CODING_STABLE",
         "WORKSPACE",
         "Operator instructions (from config):\nOPERATOR",
