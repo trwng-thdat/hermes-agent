@@ -1875,26 +1875,6 @@ def compress_context(
             commit_status="committed",
             split_status="not_applicable",
         )
-        # Emit an explicit terminal state for UI clients. The existing
-        # COMPACTION_STATUS lifecycle event marks the start; without a matching
-        # completion event, dashboard clients can only show a spinner until the
-        # whole turn ends. Keep this outside tool callbacks because compaction is
-        # runtime lifecycle work, not a model-selected tool.
-        _status_cb = getattr(agent, "status_callback", None)
-        if _status_cb:
-            try:
-                _status_cb(
-                    "compacted",
-                    (
-                        f"Context compacted: {_pre_msg_count} → "
-                        f"{len(compressed)} messages. Retrying the model request..."
-                    ),
-                )
-            except Exception:
-                logger.debug(
-                    "status_callback error after context compression",
-                    exc_info=True,
-                )
         return compressed, new_system_prompt
     finally:
         # Release the lock on the OLD session_id only AFTER rotation completed
