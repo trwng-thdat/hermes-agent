@@ -592,19 +592,42 @@ def _chat_messages_to_responses_input(
                         items.append(replay_item)
                         replayed_message_items += 1
 
+                # Assistant items MUST carry an explicit ``type: "message"`` and
+                # a parts list. A bare ``{"role": "assistant", "content":
+                # "<str>"}`` is accepted by OpenAI/xAI but rejected outright by
+                # stricter relays (llama.cpp-server's Responses surface behind
+                # LiteLLM) with HTTP 400 ``Cannot determine type of 'item'``.
+                # The rejected item lives in history, so every later turn in the
+                # session carries it and fails too. User items are inferred fine
+                # without the tag; assistant ones are not. Only locally
+                # synthesised assistant turns reach here (context-compaction
+                # summaries, interrupt placeholders) — API-minted turns replay
+                # through ``codex_message_items`` above, which already tags them.
                 if replayed_message_items > 0:
                     pass
                 elif content_parts:
-                    items.append({"role": "assistant", "content": content_parts})
+                    items.append({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": content_parts,
+                    })
                 elif content_text.strip():
-                    items.append({"role": "assistant", "content": content_text})
+                    items.append({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": content_text}],
+                    })
                 elif has_codex_reasoning:
                     # The Responses API requires a following item after each
                     # reasoning item (otherwise: missing_following_item error).
                     # When the assistant produced only reasoning with no visible
                     # content, emit an empty assistant message as the required
                     # following item.
-                    items.append({"role": "assistant", "content": ""})
+                    items.append({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": ""}],
+                    })
 
                 tool_calls = msg.get("tool_calls")
                 if isinstance(tool_calls, list):
