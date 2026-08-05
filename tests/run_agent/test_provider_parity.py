@@ -686,7 +686,35 @@ class TestChatMessagesToResponsesInputMessageItems:
                             base_url="https://chatgpt.com/backend-api/codex")
         messages = [{"role": "assistant", "content": "Hello world"}]
         items = _chat_messages_to_responses_input(messages)
-        assert items == [{"role": "assistant", "content": "Hello world"}]
+        assert items == [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Hello world"}],
+        }]
+
+    def test_synthesised_assistant_turns_are_tagged_as_message_items(self, monkeypatch):
+        """Locally-built assistant turns must carry ``type: "message"``.
+
+        A bare ``{"role": "assistant", "content": "<str>"}`` input item is
+        accepted by OpenAI/xAI but rejected by stricter Responses relays with
+        HTTP 400 ``Cannot determine type of 'item'``. Because the offending item
+        is a context-compaction summary that stays in history, every subsequent
+        turn in the session inherits it and fails too.
+        """
+        agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
+                            base_url="https://chatgpt.com/backend-api/codex")
+        messages = [
+            {"role": "user", "content": "compile the wiki"},
+            {"role": "assistant", "content": "[CONTEXT COMPACTION - REFERENCE ONLY] ..."},
+            {"role": "user", "content": "continue"},
+        ]
+        items = _chat_messages_to_responses_input(messages)
+        assistant_items = [i for i in items if i.get("role") == "assistant"]
+        assert assistant_items, "compaction summary must survive conversion"
+        for item in assistant_items:
+            assert item["type"] == "message"
+            assert isinstance(item["content"], list)
+            assert item["content"][0]["type"] == "output_text"
 
 
 
