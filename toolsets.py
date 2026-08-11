@@ -33,11 +33,13 @@ _HERMES_CORE_TOOLS = [
     "web_search", "web_extract",
     # Terminal + process management
     "terminal", "process",
-    # Desktop GUI affordances: read the embedded terminal pane, close an agent's
-    # read-only terminal tab, open a URL/file in the preview pane, focus a
-    # pane, and react to a message with an emoji (all gated on HERMES_DESKTOP
-    # via check_fn — hidden outside the GUI).
-    "read_terminal", "close_terminal", "open_preview", "focus_pane", "react_to_message",
+    # NOTE: the desktop GUI affordances (read_terminal, open_preview, …) are
+    # deliberately NOT here, for the same reason as the `project` tools below:
+    # they only work where a GUI renderer can answer them. They live in the
+    # `desktop_ui` toolset and are enabled solely by the GUI gateway for a
+    # session whose SOURCE is the desktop app (tui_gateway/server.py::
+    # _load_enabled_toolsets) — never keyed on a process env var, which is
+    # blind to a desktop client talking to a remote/cloud backend.
     # File manipulation
     "read_file", "write_file", "patch", "search_files",
     # Vision + image generation
@@ -53,6 +55,8 @@ _HERMES_CORE_TOOLS = [
     "browser_type", "browser_scroll", "browser_back",
     "browser_press", "browser_get_images",
     "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
+    # replaces other tools when browser.backend is "browser-use"
+    "browser_exec",
     # Text-to-speech
     "text_to_speech",
     # Planning & memory
@@ -77,7 +81,9 @@ _HERMES_CORE_TOOLS = [
     # profile explicitly enables the kanban toolset. Gated via check_fn in
     # tools/kanban_tools.py.
     "kanban_show", "kanban_list",
-    "kanban_complete", "kanban_block", "kanban_heartbeat",
+    "kanban_complete", "kanban_block", "kanban_request_review",
+    "kanban_request_changes",
+    "kanban_heartbeat",
     "kanban_comment", "kanban_create", "kanban_link",
     "kanban_unblock",
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
@@ -203,7 +209,7 @@ TOOLSETS = {
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp",
-            "browser_dialog", "web_search"
+            "browser_dialog", "browser_exec", "web_search"
         ],
         "includes": []
     },
@@ -262,6 +268,26 @@ TOOLSETS = {
         "tools": ["project_list", "project_create", "project_switch"],
         "includes": []
     },
+
+    # Affordances that only exist because a GUI renderer is on the other end of
+    # the connection: read/close the embedded terminal pane, open and read the
+    # in-app browser, focus a pane, tapback a message.
+    #
+    # Enabled by the GUI gateway for a session whose SOURCE is the desktop app
+    # (tui_gateway/server.py::_load_enabled_toolsets), NOT by a process env var.
+    # The renderer is a CLIENT — it can be driving a local, SSH, URL, or cloud
+    # backend — so "was this process spawned by Electron?" is the wrong
+    # question and silently strips these tools from every remote gateway.
+    "desktop_ui": {
+        "description": "Desktop GUI affordances — in-app terminal/browser panes, pane focus, reactions (GUI sessions only)",
+        "tools": [
+            "read_terminal", "close_terminal",
+            "open_preview", "read_preview",
+            "read_window_below",
+            "focus_pane", "react_to_message",
+        ],
+        "includes": []
+    },
     
     "clarify": {
         "description": "Ask the user clarifying questions (multiple-choice or open-ended)",
@@ -296,12 +322,14 @@ TOOLSETS = {
             "is spawned by the kanban dispatcher (HERMES_KANBAN_TASK env "
             "set). The dispatcher runs inside the gateway by default; see "
             "`kanban.dispatch_in_gateway` in config.yaml. Lets workers mark "
-            "tasks done with structured handoffs, block for human input, "
+            "tasks done with structured handoffs, enter first-class review "
+            "(request_review — not a block), return review changes, block for human input, "
             "heartbeat during long ops, comment on threads, attach files, and "
             "(for orchestrators) list, unblock, and fan out tasks."
         ),
         "tools": [
             "kanban_show", "kanban_list", "kanban_complete", "kanban_block",
+            "kanban_request_review", "kanban_request_changes",
             "kanban_heartbeat", "kanban_comment",
             "kanban_create", "kanban_link",
             "kanban_unblock",
@@ -377,11 +405,16 @@ TOOLSETS = {
     # code workspace; see agent/coding_context.py. Keeps everything you reach
     # for while pairing on code and drops the rest (messaging, tts, image_gen,
     # spotify, home-assistant, cron, computer-use).
+    #
+    # The GUI pane/browser affordances are NOT listed here: they belong to the
+    # client surface, not the posture, so the GUI gateway folds `desktop_ui`
+    # in alongside this selection for a desktop-sourced session (see
+    # tui_gateway/server.py::_load_enabled_toolsets).
     "coding": {
         "description": "Coding-focused toolset: files, terminal, search, web docs, skills, todo, delegate, vision, browser",
         "tools": [
             "web_search", "web_extract",
-            "terminal", "process", "read_terminal", "close_terminal",
+            "terminal", "process",
             "read_file", "write_file", "patch", "search_files",
             "vision_analyze",
             "skills_list", "skill_view", "skill_manage",
@@ -389,6 +422,7 @@ TOOLSETS = {
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
+            "browser_exec",
             "todo", "memory",
             "session_search", "clarify",
             "execute_code", "delegate_task",
@@ -421,6 +455,7 @@ TOOLSETS = {
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
+            "browser_exec",
             "todo", "memory",
             "session_search",
             "execute_code", "delegate_task",
@@ -431,6 +466,11 @@ TOOLSETS = {
     "hermes-api-server": {
         "description": "OpenAI-compatible API server with minimal read-only reference and clarification tools",
         "tools": [
+            # AI Claw: deliberately minimal — read-only reference plus clarify.
+            # Upstream ships the full tool list here; we trim it to keep the
+            # API server's context small (see perf(tools): minimize API server
+            # defaults). Pinned by tests/test_toolsets.py and
+            # tests/gateway/test_api_server_toolset.py.
             "read_file", "search_files", "clarify",
         ],
         "includes": []
