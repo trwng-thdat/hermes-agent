@@ -1050,8 +1050,17 @@ class ShellFileOperations(FileOperations):
             # overwrite the original bytes with mojibake. Treat a file whose
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
-            # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            # contains U+FFFD — EXCEPT at the tail, because the sample above is
+            # `head -c 1000`, a BYTE cut that lands mid-character whenever the
+            # file uses multi-byte UTF-8 (Vietnamese, CJK, Arabic, emoji, or a
+            # single accented word near the boundary). The orphaned prefix
+            # decodes to one trailing U+FFFD and would condemn a perfectly good
+            # text file. Skip the last few chars so only the cut's own damage is
+            # ignored; a genuinely binary sample carries U+FFFD throughout and
+            # is still caught. Slice from the END, not [:997] — 1000 bytes of
+            # multi-byte text is far fewer than 1000 characters, so a
+            # count-from-the-front bound never reaches the tail.
+            if "\ufffd" in content_sample[:-3]:
                 return True
             non_printable = sum(1 for c in content_sample[:1000]
                                if ord(c) < 32 and c not in '\n\r\t')
