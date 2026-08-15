@@ -2861,9 +2861,14 @@ class ShellFileOperations(FileOperations):
         (most recently edited first) when rg >= 13.0 supports --sortr.
         """
         # rg --files -g uses glob patterns; wrap bare names so they match
-        # at any depth (equivalent to find -name).
+        # at any depth (equivalent to find -name). Both ends, not just the
+        # leading one: a name anchored only on the left still has to END with
+        # the term, and real filenames end with an extension, so `report`
+        # silently matched nothing while report-2026.md sat right there. A
+        # trailing `*` the caller already wrote collapses into the one added
+        # here — `**` only means "recurse" as a whole path segment.
         if '/' not in pattern and not pattern.startswith('*'):
-            glob_pattern = f"*{pattern}"
+            glob_pattern = f"*{pattern}*"
         else:
             glob_pattern = pattern
 
