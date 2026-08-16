@@ -24,6 +24,8 @@ IDEMPOTENT_TOOL_NAMES = frozenset(
         "web_search",
         "web_extract",
         "session_search",
+        "tool_search",
+        "tool_describe",
         "browser_snapshot",
         "browser_console",
         "browser_get_images",
@@ -134,6 +136,13 @@ class ToolCallGuardrailConfig:
 # pathological, so the defaults are deliberately low.
 _DEFAULT_MAX_WEB_SEARCHES_PER_TURN = 50
 _DEFAULT_MAX_SUBAGENTS_PER_TURN = 50
+# The tool_search bridge (progressive tool disclosure) is the newest runaway-
+# prone surface: on a tier-2 catalog (tool names hidden) a weak model can spray
+# near-identical BM25 queries indefinitely, each returning success, so the
+# repeated-failure detector never trips and the turn burns its whole iteration
+# budget without a single tool_call. Cap discovery searches per turn — generous
+# enough for genuine multi-tool discovery, low enough to stop the spiral.
+_DEFAULT_MAX_TOOL_SEARCHES_PER_TURN = 20
 
 
 @dataclass(frozen=True)
@@ -156,6 +165,7 @@ class LoopCapConfig:
 
     max_web_searches: int = _DEFAULT_MAX_WEB_SEARCHES_PER_TURN
     max_subagents: int = _DEFAULT_MAX_SUBAGENTS_PER_TURN
+    max_tool_searches: int = _DEFAULT_MAX_TOOL_SEARCHES_PER_TURN
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any] | None) -> "LoopCapConfig":
@@ -169,6 +179,9 @@ class LoopCapConfig:
             ),
             max_subagents=_non_negative_int(
                 data.get("max_subagents"), defaults.max_subagents
+            ),
+            max_tool_searches=_non_negative_int(
+                data.get("max_tool_searches"), defaults.max_tool_searches
             ),
         )
 
@@ -287,6 +300,7 @@ class ToolCallGuardrailController:
         # single agent loop rather than accumulating across the session.
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
+        self._turn_tool_search_count = 0
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
@@ -478,6 +492,30 @@ class ToolCallGuardrailController:
                 self._halt_decision = decision
                 return decision
             self._turn_web_search_count += 1
+            return None
+
+        if tool_name == "tool_search":
+            cap = caps.max_tool_searches
+            if cap and self._turn_tool_search_count >= cap:
+                decision = ToolGuardrailDecision(
+                    action="block",
+                    code="loop_tool_search_cap",
+                    message=(
+                        f"Blocked tool_search: this turn has already searched the "
+                        f"tool catalog {cap} times, the per-turn limit. This looks "
+                        "like a runaway discovery loop. Stop searching: if the "
+                        "matches so far include a tool that fits, load it with "
+                        "tool_describe and call it; otherwise the capability is "
+                        "likely not available — tell the user what is missing or "
+                        "ask them with clarify instead of searching again."
+                    ),
+                    tool_name=tool_name,
+                    count=self._turn_tool_search_count,
+                    signature=signature,
+                )
+                self._halt_decision = decision
+                return decision
+            self._turn_tool_search_count += 1
             return None
 
         if tool_name == "delegate_task":

@@ -1638,13 +1638,14 @@ tool_loop_guardrails:
   loop_caps:
     max_web_searches: 50       # max web_search calls per turn (0 = unlimited)
     max_subagents: 50          # max subagents spawned per turn (0 = unlimited)
+    max_tool_searches: 20      # max tool_search (tool-discovery) calls per turn (0 = unlimited)
 ```
 
 `hard_stop_enabled` defaults to `false` because interactive sessions have a human in the loop. In unattended deployments (gateway, cron, kanban workers) set it to `true` so repeated failures are blocked rather than only warned. See also [Docker / unattended deployments](docker.md).
 
 ### Per-turn runaway-loop caps
 
-Separate from the failure-based thresholds above, `loop_caps` sets hard ceilings on how many `web_search` calls and subagent spawns a single agent loop (turn) may make. The counters reset at the start of every turn, so a legitimate multi-turn session is never starved — but a single turn that spirals into an unbounded search or delegation loop is stopped. These are always on and fire regardless of `hard_stop_enabled`. A single turn issuing dozens of web searches or spawning dozens of subagents is already pathological, so the defaults are low. When a cap is reached, the offending tool call is blocked with an explanatory message and the turn stops cleanly instead of burning the rest of the budget. Set either value to `0` to disable that cap entirely.
+Separate from the failure-based thresholds above, `loop_caps` sets hard ceilings on how many `web_search` calls, `tool_search` (tool-discovery) calls, and subagent spawns a single agent loop (turn) may make. The counters reset at the start of every turn, so a legitimate multi-turn session is never starved — but a single turn that spirals into an unbounded search or delegation loop is stopped. `max_tool_searches` specifically guards progressive tool disclosure: when the tool catalog is large enough to hide tool names (tier 2), a weaker model can otherwise spray near-identical discovery queries that each succeed, so the failure-based detector never trips. These are always on and fire regardless of `hard_stop_enabled`. A single turn issuing dozens of web searches or spawning dozens of subagents is already pathological, so the defaults are low. When a cap is reached, the offending tool call is blocked with an explanatory message and the turn stops cleanly instead of burning the rest of the budget. Set either value to `0` to disable that cap entirely.
 
 A single `delegate_task` batch counts each task toward `max_subagents` (a batch of 3 spends 3), so the cap tracks real subagents spawned rather than `delegate_task` invocations.
 
