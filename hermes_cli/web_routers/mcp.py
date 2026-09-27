@@ -96,16 +96,9 @@ def _mcp_install_action_name(name: str) -> str:
 async def list_mcp_servers(profile: Optional[str] = None):
     from hermes_cli.mcp_config import _get_mcp_servers
 
-    def _read():
-        config_servers = _get_mcp_servers()
-        from tui_gateway.mcp_rpc_helpers import server_configs_with_sources
-
-        return server_configs_with_sources(config_servers)
-
-    servers, plugins = await asyncio.to_thread(_secret_scoped(profile, _read))
-    return {"servers": [
-        _mcp_server_summary(name, cfg, plugins[name]) for name, cfg in sorted(servers.items())
-    ]}
+    # ``url`` may carry a ``${VAR}`` ref — expand it against the requested profile, not this process.
+    servers = await asyncio.to_thread(_secret_scoped(profile, _get_mcp_servers))
+    return {"servers": [_mcp_server_summary(name, cfg) for name, cfg in sorted(servers.items())]}
 
 
 @router.post("/api/mcp/servers")
@@ -122,15 +115,7 @@ async def add_mcp_server(body: MCPServerCreate, profile: Optional[str] = None):
         # check sits under the same lock span so a concurrent add can't slip
         # between check and save.
         with config_write_scope(body.profile or profile):
-            config_servers = _get_mcp_servers()
-            from tui_gateway.mcp_rpc_helpers import server_configs_with_sources
-
-            servers, plugins = server_configs_with_sources(config_servers)
-            if plugin := plugins.get(name):
-                raise HTTPException(
-                    status_code=409, detail=f"Server '{name}' is provided by plugin '{plugin}' and cannot be modified",
-                )
-            if name in servers:
+            if name in _get_mcp_servers():
                 raise HTTPException(status_code=409, detail=f"Server '{name}' already exists")
             if bearer_token is not None:
                 server_config["headers"] = _save_bearer_auth_token(name, bearer_token)
@@ -158,12 +143,6 @@ async def replace_mcp_servers(body: MCPServersReplace, profile: Optional[str] = 
 
     def _run():
         with config_write_scope(body.profile or profile):
-            from tui_gateway.mcp_rpc_helpers import server_configs_with_sources
-
-            _servers, plugins = server_configs_with_sources({})
-            for name in body.servers:
-                if plugin := plugins.get(name):
-                    return False, [f"Server '{name}' is provided by plugin '{plugin}' and cannot be modified"]
             return _replace_mcp_servers(body.servers)
 
     ok, issues = await asyncio.to_thread(_run)
@@ -174,18 +153,10 @@ async def replace_mcp_servers(body: MCPServersReplace, profile: Optional[str] = 
 
 @router.delete("/api/mcp/servers/{name}")
 async def remove_mcp_server(name: str, profile: Optional[str] = None):
-    from hermes_cli.mcp_config import _get_mcp_servers, _remove_mcp_server
+    from hermes_cli.mcp_config import _remove_mcp_server
 
     def _run():
         with config_write_scope(profile):
-            config_servers = _get_mcp_servers()
-            from tui_gateway.mcp_rpc_helpers import server_configs_with_sources
-
-            _servers, plugins = server_configs_with_sources(config_servers)
-            if plugin := plugins.get(name):
-                raise HTTPException(
-                    status_code=409, detail=f"Server '{name}' is provided by plugin '{plugin}' and cannot be modified",
-                )
             return _remove_mcp_server(name)
 
     if not await asyncio.to_thread(_run):
@@ -252,15 +223,37 @@ async def test_mcp_server(
     ``?force=true`` để luôn probe mới, bỏ qua cache (vd. nút "Test" thủ công
     trên dashboard).
     """
+    try:
+        return await _test_mcp_server_impl(name, profile=profile, force=force)
+    except HTTPException:
+        raise  # 404 "server not found" — giữ nguyên, không nuốt thành 500
+    except Exception as exc:  # noqa: BLE001 — cố tình bắt rộng, xem docstring
+        # Đây là lỗi XẢY RA TRƯỚC khi kịp probe (probe thật đã tự bắt lỗi
+        # riêng ở _test_mcp_server_impl, luôn trả 200 kèm ok:false — xem code
+        # bên dưới). Một exception lọt tới đây nghĩa là lỗi nằm ở bước chuẩn
+        # bị (đọc config, resolve secret scope, đọc/ghi cache...), và trước
+        # bản sửa này nó rơi tự do thành 500 "Internal Server Error" chung
+        # chung của FastAPI — không có cách nào biết dòng nào, lỗi gì, mà
+        # không có quyền truy cập trực tiếp console server. Giờ: log đầy đủ
+        # traceback ở đây (server console), VÀ trả kèm tên + message của
+        # exception trong response — để log phía caller (vd. apps/be's
+        # dashboardFetch) tự thấy được lỗi thật, không cần vào console riêng.
+        _log.exception(
+            "test_mcp_server('%s', profile=%r, force=%s) failed before probe",
+            name, profile, force,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"{type(exc).__name__}: {exc}",
+        ) from exc
+
+
+async def _test_mcp_server_impl(
+    name: str, *, profile: Optional[str], force: bool
+):
     from hermes_cli.mcp_config import _get_mcp_servers, _oauth_tokens_present, _probe_single_server
 
-    def _read():
-        config_servers = _get_mcp_servers()
-        from tui_gateway.mcp_rpc_helpers import server_configs_with_sources
-
-        return server_configs_with_sources(config_servers)[0]
-
-    servers = await asyncio.to_thread(_secret_scoped(profile, _read))
+    servers = await asyncio.to_thread(_secret_scoped(profile, _get_mcp_servers))
     if name not in servers:
         raise HTTPException(status_code=404, detail=f"Server '{name}' not found")
 
@@ -344,7 +337,7 @@ async def auth_mcp_server(name: str, request: Request, profile: Optional[str] = 
     """Start MCP OAuth and hand the authorization URL to the dashboard browser."""
     from hermes_cli.mcp_config import _get_mcp_servers
     from hermes_constants import get_hermes_home
-    from tools.mcp_dashboard_oauth import DashboardOAuthFlow, exception_message
+    from tools.mcp_dashboard_oauth import DashboardOAuthFlow
 
     _require_token(request)
     _gc_mcp_oauth_flows()
@@ -356,17 +349,11 @@ async def auth_mcp_server(name: str, request: Request, profile: Optional[str] = 
 
     def _read():
         with _profile_secret_scope(profile):
-            config_servers = _get_mcp_servers()
-            from tui_gateway.mcp_rpc_helpers import server_configs_with_sources
+            return _get_mcp_servers(), _home()
 
-            servers, plugins = server_configs_with_sources(config_servers)
-            return servers, plugins, _home()
-
-    servers, plugins, flow_home = await asyncio.to_thread(_read)
+    servers, flow_home = await asyncio.to_thread(_read)
     if name not in servers:
         raise HTTPException(status_code=404, detail=f"Server '{name}' not found")
-    if plugin := plugins.get(name):
-        raise HTTPException(status_code=409, detail=f"Server '{name}' is provided by plugin '{plugin}' and cannot be modified")
     cfg = dict(servers[name])
     if not cfg.get("url"):
         raise HTTPException(status_code=400, detail="stdio servers authenticate via env keys, not OAuth")
@@ -394,7 +381,7 @@ async def auth_mcp_server(name: str, request: Request, profile: Optional[str] = 
     try:
         await flow.wait_for_authorization_url(timeout=30)
     except Exception as exc:
-        flow.mark_error(exception_message(exc))
+        flow.mark_error(str(exc))
     return flow.snapshot()
 
 
@@ -420,7 +407,7 @@ async def cancel_mcp_oauth_flow(flow_id: str, request: Request):
     flow = _mcp_oauth_flows.get(flow_id)
     if flow is None:  # expired/GC'd is the goal state of a cancel — not an error
         return {"ok": True, "status": "expired"}
-    flow.mark_error("Cancelled by user", cancelled=True)
+    flow.mark_error("Cancelled by user")
     return {"ok": True, "status": flow.snapshot()["status"]}
 
 
@@ -464,13 +451,6 @@ async def set_mcp_server_enabled(name: str, body: MCPEnabledToggle, profile: Opt
     def _run():
         with config_write_scope(body.profile or profile):
             cfg = load_config()
-            from tui_gateway.mcp_rpc_helpers import server_configs_with_sources
-
-            _servers, plugins = server_configs_with_sources(cfg.get("mcp_servers") or {})
-            if plugin := plugins.get(name):
-                raise HTTPException(
-                    status_code=409, detail=f"Server '{name}' is provided by plugin '{plugin}' and cannot be modified",
-                )
             servers = cfg.get("mcp_servers")
             if not isinstance(servers, dict) or name not in servers:
                 raise HTTPException(status_code=404, detail=f"Server '{name}' not found")
@@ -490,7 +470,6 @@ def _catalog_entry_json(entry: Any, installed: bool, enabled: bool) -> Dict[str,
     return {
         "name": entry.name,
         "description": entry.description,
-        "connector_slug": entry.connector_slug,
         "source": entry.source,
         "transport": transport.type,
         "auth_type": getattr(auth, "type", "none"),
@@ -616,16 +595,12 @@ async def install_mcp_catalog_entry(body: MCPCatalogInstall, profile: Optional[s
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     effective_profile = body.profile or profile
-    # Secrets are persisted to .env here (before install_entry runs); non-secret
-    # values ride preloaded_env into install_entry → config.yaml, so .env stays
-    # secrets-only and nothing re-prompts on a non-TTY server.
     if body.env:
         def _write_env():
             with _profile_scope(effective_profile):
-                for spec in entry.auth.env or []:
-                    value = (body.env or {}).get(spec.name)
-                    if spec.secret and value:
-                        save_env_value(spec.name, value)
+                for k, v in body.env.items():
+                    if v:
+                        save_env_value(k, v)
 
         await asyncio.to_thread(_write_env)
 
@@ -644,10 +619,7 @@ async def install_mcp_catalog_entry(body: MCPCatalogInstall, profile: Optional[s
     # No git step — install synchronously; install_entry goes through the
     # call-time config/env resolvers so the profile scope covers it.
     try:
-        await scoped_to_thread(
-            effective_profile,
-            lambda: mcp_catalog.install_entry(entry, enable=body.enable, preloaded_env=body.env or None),
-        )
+        await scoped_to_thread(effective_profile, lambda: mcp_catalog.install_entry(entry, enable=body.enable))
     except HTTPException:
         raise
     except Exception as exc:
