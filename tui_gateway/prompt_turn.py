@@ -1051,10 +1051,30 @@ def _run_prompt_submit(
             # with tools disabled so plain messages skip the tool-search loop.
             try:
                 from . import jev_gate
-                if (jev_gate.is_enabled() and getattr(st.agent, "tools", None)
-                        and jev_gate.should_disable_tools(text)):
-                    jev_tools_restore = st.agent.tools
-                    st.agent.tools = []
+                if jev_gate.is_enabled() and getattr(st.agent, "tools", None):
+                    import time as _time
+                    _t0 = _time.monotonic()
+                    _verdict = jev_gate.evaluate_tools(text)
+                    _elapsed_ms = round((_time.monotonic() - _t0) * 1000, 1)
+                    if _verdict.get("disable"):
+                        jev_tools_restore = st.agent.tools
+                        st.agent.tools = []
+                    # Observability: report the gate decision for tracing (Phoenix
+                    # GUARDRAIL span). Fail-open — telemetry must never break a turn.
+                    try:
+                        from hermes_cli.plugins import invoke_hook
+                        invoke_hook(
+                            "pre_turn_gate", gate="jev",
+                            session_id=getattr(st.agent, "session_id", "") or sid,
+                            platform=getattr(st.agent, "platform", ""),
+                            input_text=text, disable_tools=bool(_verdict.get("disable")),
+                            p_needs_tools=_verdict.get("p_needs_tools"),
+                            skip_confidence=_verdict.get("skip_confidence"),
+                            model=_verdict.get("model"), status=_verdict.get("status"),
+                            duration_ms=_elapsed_ms,
+                        )
+                    except Exception:
+                        logger.debug("[jev-gate] telemetry hook failed", exc_info=True)
             except Exception:
                 logger.debug("[jev-gate] skipped", exc_info=True)
             # ──────────────────────────────────────────────────────────────────
