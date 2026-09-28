@@ -70,14 +70,29 @@ def is_enabled() -> bool:
     return bool(c["enabled"] and c["api_key"])
 
 
-def should_disable_tools(text: Any) -> bool:
-    """Ask JEV if this turn needs no tools. Returns True only on a confident
-    "no tools" verdict; fail-open to False on anything uncertain or broken."""
-    if not isinstance(text, str) or not text.strip():
-        return False
+def evaluate_tools(text: Any) -> Dict[str, Any]:
+    """Ask JEV whether this turn needs any tool, returning the full verdict:
+
+        {"disable": bool,           # True only on a confident "no tools" verdict
+         "p_needs_tools": float|None,  # JEV's P(needs tools), None when not evaluated
+         "status": str,             # ok | empty_input | no_api_key | http_<code> | error
+         "model": str,
+         "skip_confidence": float}
+
+    Fail-open: ``disable`` is False on anything uncertain or broken. This is the
+    single source of truth; :func:`should_disable_tools` is a thin wrapper for
+    callers that only need the boolean."""
     c = _config()
+    verdict: Dict[str, Any] = {
+        "disable": False, "p_needs_tools": None, "status": "error",
+        "model": c["model"], "skip_confidence": c["skip_confidence"],
+    }
+    if not isinstance(text, str) or not text.strip():
+        verdict["status"] = "empty_input"
+        return verdict
     if not c["api_key"]:
-        return False
+        verdict["status"] = "no_api_key"
+        return verdict
     try:
         import requests
 
@@ -114,7 +129,8 @@ def should_disable_tools(text: Any) -> bool:
         )
         if resp.status_code != 200:
             logger.warning("[jev-gate] HTTP %s: %s", resp.status_code, resp.text[:300])
-            return False
+            verdict["status"] = f"http_{resp.status_code}"
+            return verdict
         answer = (resp.json().get("answers") or {}).get("needs_tools") or {}
         # noul is P("true") = P(needs tools); default to 1.0 (safe = keep tools).
         p_needs = float(answer.get("noul", 1.0))
@@ -125,7 +141,15 @@ def should_disable_tools(text: Any) -> bool:
             disable,
             text[:80],
         )
-        return disable
+        verdict.update({"disable": disable, "p_needs_tools": p_needs, "status": "ok"})
+        return verdict
     except Exception as e:
         logger.debug("[jev-gate] failed (non-fatal): %s", e)
-        return False
+        verdict["status"] = "error"
+        return verdict
+
+
+def should_disable_tools(text: Any) -> bool:
+    """Backwards-compatible wrapper: the boolean "run this turn with no tools" verdict.
+    Fail-open to False. See :func:`evaluate_tools` for the full verdict."""
+    return bool(evaluate_tools(text)["disable"])

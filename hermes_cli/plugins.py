@@ -116,6 +116,11 @@ VALID_HOOKS: Set[str] = {
     # {"action": "continue", "message"} (or Claude-Code Stop {"decision": "block", "reason"}) to keep
     # going; anything else finishes. Bounded by agent.max_verify_nudges.
     "pre_verify", "pre_api_request", "post_api_request", "api_request_error",
+    # pre_turn_gate: once per user turn when a detachable pre-turn tool gate (e.g. the JEV gate in
+    # tui_gateway/prompt_turn.py) has evaluated whether the turn needs tools, BEFORE the LLM call.
+    # Observer; returns ignored. Kwargs: gate (str), session_id, platform, input_text, disable_tools
+    # (bool verdict), p_needs_tools (float|None), skip_confidence (float|None), model, status, duration_ms.
+    "pre_turn_gate",
     # pre/post_auxiliary_call: once per physical provider attempt of an auxiliary LLM call
     # (agent/auxiliary_hooks.py — titling, compression, MoA, vision, approval, ...). Same payload
     # shape as pre/post_api_request plus ``aux_task``; distinct events so turn-scoped
