@@ -2606,8 +2606,12 @@ def _deferred_session_record(
     close_on_disconnect: bool = False, display_history_prefix: list | None = None,
     profile_home: Path | None = None, lazy: bool = False, model_override=None,
     resume_runtime_overrides: dict | None = None, todo_state: dict | None = None,
-    explicit_cwd: bool = False) -> dict:
-    """A live-session record whose AIAgent is built later (lazy watch / cold resume) — _init_session's shape minus the agent."""
+    explicit_cwd: bool = False, hermes_user_id: str = "") -> dict:
+    """A live-session record whose AIAgent is built later (lazy watch / cold resume) — _init_session's shape minus the agent.
+
+    ``hermes_user_id`` is the end-user id forwarded by the calling backend (``session.create`` / ``session.resume``
+    ``user_id``). A resume rebuilds the record from scratch, so it must be carried here or the rebuilt session
+    loses HERMES_SESSION_USER_ID and MCP tool calls run as the shared runtime-token owner."""
     now = time.time()
     return {
         "agent": None, "agent_error": None, "agent_ready": threading.Event(), "attached_images": [],
@@ -2624,6 +2628,7 @@ def _deferred_session_record(
         "tool_started_at": {}, "todo_state": todo_state,
         "transport": current_transport() or _stdio_transport,
         "auth_user_id": _transport_auth_user_id(current_transport()),
+        "hermes_user_id": hermes_user_id,
     }
 
 
