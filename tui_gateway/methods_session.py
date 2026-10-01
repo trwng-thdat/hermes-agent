@@ -521,6 +521,9 @@ class _Resume:
 
     def __init__(self, rid, params: dict, target: str) -> None:
         self.rid, self.params, self.target = rid, params, target
+        # End-user id forwarded by the calling backend (same contract as session.create's ``user_id``). Not
+        # authenticated by Hermes; the caller is trusted to have verified it upstream.
+        self.hermes_user_id = _str_param(params, "user_id")
         self.db, self.owns_db, self.found, self.profile_resume_cwd = None, False, None, ""
         self.cols = _int_param(params, "cols", 80)
         # ``profile`` (app-global remote mode): resume from another local profile's state.db.
@@ -549,7 +552,8 @@ class _Resume:
         record = _deferred_session_record(
             self.target, cols=self.cols, cwd=cwd, history=history, lease=None, source=source,
             close_on_disconnect=_flag(self.params, "close_on_disconnect"),
-            profile_home=self.profile_home, explicit_cwd=bool(self.profile_resume_cwd), **extra)
+            profile_home=self.profile_home, explicit_cwd=bool(self.profile_resume_cwd),
+            hermes_user_id=self.hermes_user_id, **extra)
         if follows_profile:
             record.update(
                 follow_profile_config=True,
@@ -726,6 +730,10 @@ def _resume_reuse_live_locked(ctx: _Resume, sid: str, session: dict) -> dict:
     """Reuse with _session_resume_lock already held (including the eager double-check)."""
     if (refusal := _reattach_refusal(ctx.rid, sid, session)) is not None:
         return refusal
+    # Rebind the end user to whoever is resuming now: a live session can be reattached by a different member
+    # of the same company, and tool calls must run as them, not as whoever created the session.
+    if ctx.hermes_user_id:
+        session["hermes_user_id"] = ctx.hermes_user_id
     _cancel_ws_orphan_reap(sid)  # unconditionally: the fast path must never race the reap Timer
     payload = _live_session_payload(sid, session, cols=ctx.cols, touch=True, omit_messages=ctx.omit_messages,
                                     transport=current_transport() or _stdio_transport)
@@ -861,6 +869,7 @@ def _resume_eager(ctx: _Resume) -> dict:
                     _transfer_db_to_agent(agent, ctx.db)
                 ctx.owns_db = False
             if (session := _sessions.get(sid)) is not None:
+                session["hermes_user_id"] = ctx.hermes_user_id
                 if stored_runtime_overrides.get("model_override") is not None:
                     session["model_override"] = stored_runtime_overrides["model_override"]
                 model_config = _parse_model_config(ctx.found.get("model_config"), quiet=True)
@@ -2017,6 +2026,8 @@ def _build_branch_agent(session: dict, new_sid: str, new_key: str, history: list
         if new_sid in _sessions:
             _sessions[new_sid]["active_session_lease"] = None  # claimed lazily on the first turn
             _sessions[new_sid]["auth_user_id"] = parent_user_id
+            # A branch continues the parent's conversation, so tools keep running as the same end user.
+            _sessions[new_sid]["hermes_user_id"] = session.get("hermes_user_id") or ""
         return agent
     finally:
         if branch_owns_db and branch_db is not None:

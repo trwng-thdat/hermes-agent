@@ -2,6 +2,7 @@
 ladder: trust gating, circuit breaker, auth (401) refresh, session-expired reconnect and dead-stdio respawn retry."""
 
 import logging
+import os
 import asyncio
 import contextvars
 import inspect
@@ -25,6 +26,15 @@ from tools.mcp_tool_errors import _is_auth_error, _is_session_expired_error
 
 logger = logging.getLogger("tools.mcp_tool")
 _MISSING = object()
+
+# MCP server that scopes every call to an end user (see _make_tool_handler).
+_JARVIS_MCP_SERVER = "jarvis-mcp"
+
+
+def _mcp_requires_user_id() -> bool:
+    """Strict mode: refuse jarvis-mcp calls that carry no end-user id instead of letting the server default to
+    the runtime-token owner. Opt-in (``HERMES_MCP_REQUIRE_USER_ID=1``) because cron/background runs have no user."""
+    return os.environ.get("HERMES_MCP_REQUIRE_USER_ID", "").strip().lower() in ("1", "true", "yes", "on")
 
 declaration.on_change = invalidate_check_fn_cache
 
@@ -560,10 +570,24 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         # Jarvis: forward the end-user id bound on the session (HERMES_SESSION_USER_ID, set from the
         # X-Hermes-User-Id header / TUI session.create user_id) so the jarvis-mcp server can scope its
         # calls per user without the model having to know or guess the id.
-        from gateway.session_context import get_session_env
-        _uid = get_session_env("HERMES_SESSION_USER_ID")
-        if _uid and server_name == "jarvis-mcp":
-            args = {**args, "user_id": _uid}
+        if server_name == _JARVIS_MCP_SERVER:
+            from gateway.session_context import get_session_env
+            _uid = get_session_env("HERMES_SESSION_USER_ID")
+            # Never let the model choose who the call runs as: drop any user_id it supplied and bind only the
+            # id carried by the session.
+            args = {k: v for k, v in args.items() if k != "user_id"}
+            if _uid:
+                args["user_id"] = _uid
+            else:
+                # Without an end-user id the MCP server falls back to the runtime-token owner (the company
+                # creator), silently running the call under the wrong account.
+                logger.warning(
+                    "MCP tool '%s' on '%s' called without HERMES_SESSION_USER_ID; the server will fall back "
+                    "to the runtime-token owner", tool_name, server_name)
+                if _mcp_requires_user_id():
+                    return tool_error(
+                        f"MCP tool '{tool_name}' was blocked: this session has no end-user id, so the call "
+                        "would run as the workspace owner instead of the current user.")
         # Security boundary: untrusted-server write tools need approval before ANY transport work (incl. lazy spawn).
         error = _trust_gate_check(server_name, tool_name) or _check_circuit_breaker(server_name)
         if error is not None:
