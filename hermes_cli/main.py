@@ -118,6 +118,8 @@ _ONESHOT_CLEANUPS = (
     ("tools.browser_tool_lifecycle", "_emergency_cleanup_all_sessions", {}, Exception),
     ("tools.mcp_tool_lifecycle", "shutdown_mcp_servers", {}, BaseException),
     ("agent.auxiliary_client", "shutdown_cached_clients", {}, Exception),
+    # Its atexit drain is skipped by os._exit: deliver the final on_session_end first.
+    ("agent.outbound_webhooks", "flush", {}, Exception),
 )
 
 

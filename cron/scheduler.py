@@ -2492,6 +2492,7 @@ def run_job(
     if early is not None:
         return early
     from run_agent import AIAgent
+    from agent import outbound_webhooks
 
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
@@ -2508,6 +2509,9 @@ def run_job(
         if scope.workdir:
             logger.info("Job '%s': using task-scoped workdir %s", job_id, scope.workdir)
         _reload_dotenv_and_publish_delivery_target(job)
+        # Only the gateway and CLI register hooks.outbound at startup; a run executed by the dashboard
+        # or the detached worker must still announce on_session_end for the profile that owns the job.
+        outbound_webhooks.register_for_current_profile()
 
         jc = _load_cron_job_config(job, job_id, job_name)
         _cfg = jc.cfg

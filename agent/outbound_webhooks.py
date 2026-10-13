@@ -46,6 +46,9 @@ QUEUE_MAX_SIZE = 256
 _registered: Set[Tuple[str, str, str]] = set()
 _registered_lock = threading.Lock()
 
+# Plain-http advisory is per URL per process: a cron run re-parses the config on every fire.
+_warned_plain_http: Set[str] = set()
+
 _delivery_queue: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=QUEUE_MAX_SIZE)
 _worker_lock = threading.Lock()
 _worker: Optional[threading.Thread] = None
@@ -103,6 +106,21 @@ def register_from_config(cfg: Optional[Dict[str, Any]]) -> List[WebhookTarget]:
     return registered
 
 
+def register_for_current_profile() -> List[WebhookTarget]:
+    """Register the BOUND profile's ``hooks.outbound`` (home + secret scope must already be its own).
+
+    For processes that run a turn without having registered at startup: a cron run executed by the
+    dashboard (run-now) or by the detached ``--external-worker-file`` worker would otherwise end its
+    session unannounced. Idempotent per (home, event, url), so the gateway/CLI's startup registration
+    makes this a no-op there. Never raises: a broken config must not fail the run it observes."""
+    try:
+        from hermes_cli.config import load_config
+        return register_from_config(load_config())
+    except Exception:
+        logger.warning("outbound webhook registration for the current profile failed", exc_info=True)
+        return []
+
+
 def iter_configured_targets(cfg: Optional[Dict[str, Any]]) -> List[WebhookTarget]:
     """Parse ``hooks.outbound`` without registering anything (``hermes hooks list``)."""
     if not isinstance(cfg, dict):
@@ -147,6 +165,7 @@ def reset_for_tests() -> None:
     """Clear the idempotence set and drain the queue.  Test-only helper."""
     with _registered_lock:
         _registered.clear()
+    _warned_plain_http.clear()
     try:
         while True:
             _delivery_queue.get_nowait()
@@ -172,7 +191,8 @@ def _parse_single_target(index: int, raw: Any) -> Optional[WebhookTarget]:
     if not url.lower().startswith(("http://", "https://")):
         warn(".url must be http(s); got %r — skipped", url)
         return None
-    if url.lower().startswith("http://"):
+    if url.lower().startswith("http://") and url not in _warned_plain_http:
+        _warned_plain_http.add(url)
         warn(".url uses plain http:// — payloads (including tool inputs) travel unencrypted. Prefer https.")
     events_raw = raw.get("events")
     valid_list = ", ".join(sorted(VALID_HOOKS))
