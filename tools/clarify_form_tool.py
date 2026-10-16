@@ -50,6 +50,22 @@ def _normalize_questions(raw: Any) -> List[Dict[str, Any]]:
     return normalized
 
 
+def _coerce_answers(raw: Any) -> Optional[List[Dict[str, Any]]]:
+    """Accept every shape a platform callback hands back: ``[{id, answer}]``, an
+    ``{id: answer}`` map (the dashboard's ``clarify_form`` result), or either one
+    JSON-encoded. ``None`` means the user cancelled or the card timed out."""
+    if isinstance(raw, str):
+        if not raw.strip():
+            return None
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return None
+    if isinstance(raw, dict):
+        return [{"id": str(k), "answer": v} for k, v in raw.items()]
+    return raw if isinstance(raw, list) else None
+
+
 def _normalize_answers(
     questions: List[Dict[str, Any]],
     raw_answers: Any,
@@ -97,7 +113,8 @@ def clarify_form_tool(
             ensure_ascii=False,
         )
 
-    if not isinstance(raw_answers, list):
+    raw_answers = _coerce_answers(raw_answers)
+    if raw_answers is None:
         return json.dumps(
             {"responses": [], "answered": False},
             ensure_ascii=False,

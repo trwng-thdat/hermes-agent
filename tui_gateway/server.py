@@ -1348,10 +1348,11 @@ def _clarify_timeout_seconds() -> float | None:
     return 300
 
 
-def _clarify_form_block(sid: str, questions) -> str:
+def _clarify_form_block(sid: str, questions) -> list[dict] | None:
     """Bridge the clarify_form tool callback onto a ``clarify_form`` server request: one card carrying
-    every question, answered in a single submit. Returns the answers map as JSON (`""` when the user
-    cancelled, the card timed out, or the client does not answer server requests)."""
+    every question, answered in a single submit. Returns ``[{id, answer}]`` — the shape
+    ``clarify_form_tool`` reads — or ``None`` when the user cancelled, the card timed out, or the
+    client does not answer server requests."""
     from tui_gateway import server_requests
     wire = [{"id": str(q.get("id") or ""), "question": str(q.get("question") or ""),
              "choices": q.get("choices"), "multiSelect": bool(q.get("multiSelect"))}
@@ -1359,8 +1360,8 @@ def _clarify_form_block(sid: str, questions) -> str:
     result = server_requests.send("clarify_form", sid, {"questions": wire},
                                   timeout=_clarify_timeout_seconds())
     if not result or "answers" not in result:
-        return ""
-    return json.dumps(result.get("answers") or {}, ensure_ascii=False)
+        return None
+    return [{"id": str(k), "answer": v} for k, v in (result.get("answers") or {}).items()]
 
 
 def _clarify_block(sid: str, q, c, multi_select=False, questions=None) -> str:
