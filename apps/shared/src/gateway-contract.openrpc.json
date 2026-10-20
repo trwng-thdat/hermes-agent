@@ -28609,6 +28609,30 @@
             "default": false,
             "title": "Follow Profile Config",
             "type": "boolean"
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "User Id"
+          },
+          "helpdesk_account_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Helpdesk Account Id"
           }
         },
         "title": "SessionCreateParams",
@@ -29992,6 +30016,30 @@
             "default": false,
             "title": "Close On Disconnect",
             "type": "boolean"
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "User Id"
+          },
+          "helpdesk_account_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Helpdesk Account Id"
           }
         },
         "required": [

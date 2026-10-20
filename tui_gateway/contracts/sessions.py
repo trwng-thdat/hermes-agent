@@ -134,6 +134,8 @@ class SessionCreateParams(ProfileParams):
     # HERMES_SESSION_USER_ID every turn (see methods_session.py::session.create). The handler
     # reads it via _str_param, so the contract must declare it or extra="forbid" answers 4000.
     user_id: str | None = None
+    # That user's Helpdesk account id, re-bound as HERMES_SESSION_HELPDESK_ACCOUNT_ID ("" = not linked).
+    helpdesk_account_id: str | None = None
 
 
 class SessionCreateResult(Result):
@@ -161,6 +163,8 @@ class SessionResumeParams(SessionParams):
     omit_messages: bool = False
     eager_build: bool = False
     close_on_disconnect: bool = False
+    user_id: str | None = None  # same contract as session.create
+    helpdesk_account_id: str | None = None
 
 
 class SessionResumeResult(LiveSessionSnapshot):
