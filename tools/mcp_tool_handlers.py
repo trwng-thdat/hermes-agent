@@ -29,12 +29,27 @@ _MISSING = object()
 
 # MCP server that scopes every call to an end user (see _make_tool_handler).
 _JARVIS_MCP_SERVER = "jarvis-mcp"
+# tools/call ``_meta`` key naming the end user a ``forward_session_user`` server should act as.
+_ACTING_ACCOUNT_META_KEY = "ai.jarvis/actingAccountId"
 
 
 def _mcp_requires_user_id() -> bool:
     """Strict mode: refuse jarvis-mcp calls that carry no end-user id instead of letting the server default to
     the runtime-token owner. Opt-in (``HERMES_MCP_REQUIRE_USER_ID=1``) because cron/background runs have no user."""
     return os.environ.get("HERMES_MCP_REQUIRE_USER_ID", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _acting_user_meta(server: Any) -> Optional[dict]:
+    """``_meta`` for a ``forward_session_user`` server: the session's Helpdesk account id ("" = not linked).
+    None (no meta, the server acts as its token owner) without a real end user, e.g. cron or ``system`` calls."""
+    config = getattr(server, "_config", None)
+    if not isinstance(config, dict) or config.get("forward_session_user") is not True:
+        return None
+    from gateway.session_context import get_session_env
+    user_id = get_session_env("HERMES_SESSION_USER_ID").strip()
+    if not user_id or user_id == "system":
+        return None
+    return {_ACTING_ACCOUNT_META_KEY: get_session_env("HERMES_SESSION_HELPDESK_ACCOUNT_ID").strip()}
 
 declaration.on_change = invalidate_check_fn_cache
 
@@ -387,7 +402,8 @@ async def _track_inflight_rpc(server: Any, server_name: str, op: str, *, retry_s
             inflight.discard(task)
 
 
-async def _call_tool_racing_stdio_death(server, server_name: str, tool_name: str, args: dict):
+async def _call_tool_racing_stdio_death(server, server_name: str, tool_name: str, args: dict,
+                                        meta: Optional[dict] = None):
     """``session.call_tool`` that fails fast when the stdio child is/gets dead: pre-call (a dead
     child must not hold the slot for the full timeout) and mid-call (race against
     ``_watch_stdio_children``). Both raise :class:`_StdioChildExited` for the respawn path, which
@@ -401,7 +417,8 @@ async def _call_tool_racing_stdio_death(server, server_name: str, tool_name: str
             f"MCP stdio subprocess for '{server_name}' had already exited when the call was dispatched",
             in_flight=False,
         )
-    _call_coro = server.session.call_tool(tool_name, arguments=args)
+    _call_coro = (server.session.call_tool(tool_name, arguments=args) if meta is None
+                  else server.session.call_tool(tool_name, arguments=args, meta=meta))
     _watch_children = getattr(server, "_watch_stdio_children", None)
     if not (inspect.iscoroutinefunction(_watch_children) and asyncio.iscoroutine(_call_coro)):
         # Stubbed sessions return a non-awaitable, or there is no child-watcher to race: plain await.
@@ -598,12 +615,14 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         # Only a tool annotated readOnlyHint=True is replayed after session expiry; a 401 is always
         # pre-dispatch so the auth recoverer keeps its retry for every tool.
         read_only = _tool_is_read_only(server_name, tool_name)
+        # Read here, not inside _call: the session ContextVars do not follow the call onto the MCP loop.
+        meta = _acting_user_meta(server)
 
         async def _call():
             async with server._rpc_lock, _track_inflight_rpc(server, server_name, op, retry_safe=read_only):
                 server._pending_call_context = contextvars.copy_context()  # for the elicitation callback
                 try:
-                    result = await _call_tool_racing_stdio_death(server, server_name, tool_name, args)
+                    result = await _call_tool_racing_stdio_death(server, server_name, tool_name, args, meta)
                 finally:
                     server._pending_call_context = None
             if getattr(server, "_mark_session_proven", None) is not None:  # round-trip done: transport healthy
