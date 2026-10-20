@@ -453,6 +453,7 @@ class _RunLaunch:
     browser_control_principal: Any
     browser_control_transport_family: Any
     user_id: str = ""  # X-Hermes-User-Id, bound as HERMES_SESSION_USER_ID for the run
+    helpdesk_account_id: str = ""  # X-Hermes-Helpdesk-Account-Id, bound as HERMES_SESSION_HELPDESK_ACCOUNT_ID
     turn_author: Optional[Dict[str, Any]] = None  # memory-attribution label only; grants nothing
 
     @property
@@ -575,6 +576,9 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     user_id, uid_err = self._parse_user_id_header(request)
     if uid_err is not None:
         return uid_err
+    helpdesk_account_id, hd_err = self._parse_helpdesk_account_header(request)
+    if hd_err is not None:
+        return hd_err
     try:
         body = await request.json()
     except Exception:
@@ -689,7 +693,7 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         request_profile=_api_server._api_request_profile.get(),
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
-        user_id=user_id or "", turn_author=turn_author)
+        user_id=user_id or "", helpdesk_account_id=helpdesk_account_id or "", turn_author=turn_author)
     self._activate_admitted_request()
     # A canonical Bot Chat that a Desktop holds live is that Desktop's to run: executing here would
     # be a second writer beside its lease (#114959). The owner's mailbox takes the turn and its
@@ -754,7 +758,7 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
             # tools.async_delegation sees no HERMES_SESSION_CHAT_ID and forces delegations sync.
             session_tokens = self._bind_api_server_session(
                 chat_id=session_id or "", session_key=run.approval_session_key, session_id=session_id or "",
-                user_id=run.user_id or "",
+                user_id=run.user_id or "", helpdesk_account_id=run.helpdesk_account_id or "",
                 profile=run.request_profile or "",
                 browser_control_principal=run.browser_control_principal,
                 browser_control_transport_family=run.browser_control_transport_family,

@@ -1718,13 +1718,23 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         """Validate ``X-Hermes-User-Id`` (end-user identity forwarded by the calling backend, bound
         as HERMES_SESSION_USER_ID for MCP calls) -> ``(id_or_None, None)`` or ``(None, error)``.
         Requires API-key auth so an anonymous client can't impersonate another user."""
-        raw = request.headers.get("X-Hermes-User-Id", "").strip()
+        return self._parse_identity_header(request, "X-Hermes-User-Id", "Invalid user id")
+
+    def _parse_helpdesk_account_header(
+        self, request: "web.Request") -> tuple[Optional[str], Optional["web.Response"]]:
+        """``X-Hermes-Helpdesk-Account-Id`` (bound as HERMES_SESSION_HELPDESK_ACCOUNT_ID), validated like the user id."""
+        return self._parse_identity_header(request, "X-Hermes-Helpdesk-Account-Id", "Invalid helpdesk account id")
+
+    def _parse_identity_header(
+        self, request: "web.Request", header: str,
+        invalid_message: str) -> tuple[Optional[str], Optional["web.Response"]]:
+        raw = request.headers.get(header, "").strip()
         if not raw:
             return None, None
         if not self._api_key:
-            return None, _error_response("X-Hermes-User-Id requires API key authentication.", 403)
+            return None, _error_response(f"{header} requires API key authentication.", 403)
         if re.search(r'[\r\n\x00]', raw) or len(raw) > self._MAX_SESSION_HEADER_LEN:
-            return None, _invalid_request("Invalid user id")
+            return None, _invalid_request(invalid_message)
         return raw, None
 
     # -- Responses state ----------------------------------------------------------------
@@ -3173,6 +3183,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         user_id, uid_err = self._parse_user_id_header(request)
         if uid_err is not None:
             return None, uid_err
+        helpdesk_account_id, hd_err = self._parse_helpdesk_account_header(request)
+        if hd_err is not None:
+            return None, hd_err
         session_id = request.match_info["session_id"]
         session, err = await self._get_existing_session_or_404(session_id)
         if err:
@@ -3226,6 +3239,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             requested_runtime=runtime_request.get("requested") or {},
             route_source=runtime_request.get("route_source") or "global",
             confirmed_runtime_lock=lock_active, user_id=user_id, turn_author=turn_author,
+            helpdesk_account_id=helpdesk_account_id,
             # #98619: the client addresses this session by construction — the id is in the
             # request path (/api/sessions/{session_id}/chat) — so a wake self-post lands where
             # the client will read it. The audited native-session opt-in.
@@ -3906,13 +3920,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     def _bind_api_server_session(
         *, chat_id: str = "", session_key: str = "", session_id: str = "", user_id: str = "",
         profile: str = "", browser_control_principal: str = "",
-        browser_control_transport_family: str = "", session_history_delivery: str = "") -> list:
+        browser_control_transport_family: str = "", session_history_delivery: str = "",
+        helpdesk_account_id: str = "") -> list:
         """Bind an API turn with push disabled and history delivery default-denied.
 
         The SINGLE chokepoint for every agent-entry path: hardwires ``platform="api_server"`` +
         ``async_delivery=False`` (HTTP can never wake the agent after the turn) so no route
         reintroduces the silent no-op bug, and carries ``user_id`` (X-Hermes-User-Id) into
-        ``HERMES_SESSION_USER_ID``. Returns reset tokens for ``clear_session_vars`` in a
+        ``HERMES_SESSION_USER_ID`` (and X-Hermes-Helpdesk-Account-Id into
+        ``HERMES_SESSION_HELPDESK_ACCOUNT_ID``). Returns reset tokens for ``clear_session_vars`` in a
         ``finally`` (request-scoped).
 
         Only routes whose continuation reads SessionDB may pass "1". An omitted
@@ -3926,7 +3942,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             platform="api_server", chat_id=chat_id, session_key=session_key, session_id=session_id,
             user_id=user_id, profile=profile, browser_control_principal=browser_control_principal,
             browser_control_transport_family=browser_control_transport_family,
-            async_delivery=False, cron_session="", session_history_delivery=session_history_delivery)
+            async_delivery=False, cron_session="", session_history_delivery=session_history_delivery,
+            helpdesk_account_id=helpdesk_account_id)
 
     def _turn_runtime_metadata(
         self, agent: Any, *, route: Optional[Dict[str, Any]], requested_runtime: Optional[Dict[str, Any]],
@@ -4009,7 +4026,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None, route_source: str = "global",
         confirmed_runtime_lock: bool = False, bind_declared_conversation: bool = False,
         user_id: Optional[str] = None, session_history_delivery: str = "",
-        turn_author: Optional[Dict[str, Any]] = None,
+        helpdesk_account_id: Optional[str] = None, turn_author: Optional[Dict[str, Any]] = None,
         relay_metadata: Optional[Dict[str, Any]] = None, notification_category: str = "result",
         resume_unanswered_turn: bool = False) -> tuple:
         """Create an agent and run one turn in a thread executor -> ``(result, usage)``.
@@ -4036,6 +4053,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 tokens = self._bind_api_server_session(
                     chat_id=session_id or "", session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "", user_id=user_id or "", profile=request_profile or "",
+                    helpdesk_account_id=helpdesk_account_id or "",
                     browser_control_principal=request_browser_control_principal,
                     browser_control_transport_family=request_browser_control_transport_family,
                     session_history_delivery=session_history_delivery)
