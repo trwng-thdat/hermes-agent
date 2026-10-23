@@ -50,13 +50,6 @@ def _str_param(params: dict, key: str, default: str = "") -> str:
     return str(params.get(key) or "").strip() or default
 
 
-def _acting_account_param(params: dict) -> str:
-    """The chatting user's SSO account id from ``acting_account_id``; callers built before the rename
-    send ``helpdesk_account_id``, read only when the new key is absent (the new name wins)."""
-    key = "acting_account_id" if params.get("acting_account_id") is not None else "helpdesk_account_id"
-    return _str_param(params, key)
-
-
 def _flag(params: dict, name: str) -> bool:
     return is_truthy_value(params.get(name, False))
 
@@ -360,7 +353,7 @@ def _(rid, params: dict) -> dict:
     # HERMES_SESSION_USER_ID via _set_session_context, mirroring how `source`/`cwd` are threaded
     # through. Not authenticated by Hermes itself; the caller is trusted to have verified it upstream.
     hermes_user_id = _str_param(params, "user_id")
-    acting_account_id = _acting_account_param(params)
+    acting_account_id = _str_param(params, "acting_account_id")
     _enable_gateway_prompts()
     session_model_override, create_reasoning_override, create_service_tier_override = _create_overrides(params)
     now = time.time()
@@ -532,7 +525,7 @@ class _Resume:
         # End-user id forwarded by the calling backend (same contract as session.create's ``user_id``). Not
         # authenticated by Hermes; the caller is trusted to have verified it upstream.
         self.hermes_user_id = _str_param(params, "user_id")
-        self.acting_account_id = _acting_account_param(params)
+        self.acting_account_id = _str_param(params, "acting_account_id")
         self.db, self.owns_db, self.found, self.profile_resume_cwd = None, False, None, ""
         self.cols = _int_param(params, "cols", 80)
         # ``profile`` (app-global remote mode): resume from another local profile's state.db.

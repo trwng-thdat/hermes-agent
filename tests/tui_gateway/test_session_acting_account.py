@@ -1,6 +1,5 @@
 """``acting_account_id`` (the chatting user's SSO account id) on session.create / session.resume is
-bound as HERMES_SESSION_ACTING_ACCOUNT_ID for each turn, alongside ``user_id``. The pre-rename
-``helpdesk_account_id`` is still accepted from older callers; the new name wins when both are sent."""
+bound as HERMES_SESSION_ACTING_ACCOUNT_ID for each turn, alongside ``user_id``."""
 
 import pytest
 
@@ -49,20 +48,9 @@ def test_create_binds_acting_account_for_the_turn_and_clears_after(created, acco
     assert get_session_env(_ENV, "unset") == ""
 
 
-@pytest.mark.parametrize("params, expected", [
-    ({"helpdesk_account_id": "old-1"}, "old-1"),
-    ({"acting_account_id": "new-1", "helpdesk_account_id": "old-1"}, "new-1"),
-    ({"acting_account_id": "", "helpdesk_account_id": "old-1"}, ""),
-])
-def test_create_accepts_the_legacy_name_and_prefers_the_new_one(created, params, expected):
-    session = created({"cols": 80, "user_id": "u-1", **params})
-    assert _bound_account(session) == expected
-
-
 @pytest.mark.parametrize("method", ["session.create", "session.resume"])
-@pytest.mark.parametrize("field", ["acting_account_id", "helpdesk_account_id"])
-def test_contract_accepts_both_names(method, field):
-    params = {"user_id": "u-1", field: "acc-42"}
+def test_contract_accepts_the_acting_account(method):
+    params = {"user_id": "u-1", "acting_account_id": "acc-42"}
     if method == "session.resume":
         params["session_id"] = "s"
     _, problem = validate_params(METHODS[method], params)
@@ -71,11 +59,10 @@ def test_contract_accepts_both_names(method, field):
 
 @pytest.mark.parametrize("params, expected", [
     ({"acting_account_id": "acc-42"}, "acc-42"),
-    ({"helpdesk_account_id": " old-1 "}, "old-1"),
-    ({"acting_account_id": "new-1", "helpdesk_account_id": "old-1"}, "new-1"),
+    ({"acting_account_id": " acc-42 "}, "acc-42"),
     ({}, ""),
 ])
-def test_resume_reads_the_legacy_name_and_prefers_the_new_one(params, expected):
+def test_resume_reads_the_acting_account(params, expected):
     from tui_gateway.methods_session import _Resume
 
     assert _Resume("r1", {"session_id": "s", **params}, "s").acting_account_id == expected

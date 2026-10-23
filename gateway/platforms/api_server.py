@@ -60,10 +60,8 @@ class _ArtifactScopeFacade:
         self.transport_family = transport_family
 
 
-# The chatting user's SSO account id, forwarded by the calling backend. The legacy name is still
-# read (new name wins) because callers deployed before the rename send only that one.
+# The chatting user's SSO account id, forwarded by the calling backend.
 ACTING_ACCOUNT_HEADER = "X-Hermes-Acting-Account-Id"
-LEGACY_ACTING_ACCOUNT_HEADER = "X-Hermes-Helpdesk-Account-Id"
 
 # Advertised in capabilities and echoed in registration responses; validated by the broker.
 _BROWSER_CONTROL_PROTOCOL_VERSION = 1
@@ -1728,11 +1726,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     def _parse_acting_account_header(
         self, request: "web.Request") -> tuple[Optional[str], Optional["web.Response"]]:
         """``X-Hermes-Acting-Account-Id``: the chatting user's SSO account id (bound as
-        HERMES_SESSION_ACTING_ACCOUNT_ID), validated like the user id. Callers built before the rename
-        send ``X-Hermes-Helpdesk-Account-Id``; it is read only when the new header is absent."""
-        if request.headers.get(ACTING_ACCOUNT_HEADER, "").strip():
-            return self._parse_identity_header(request, ACTING_ACCOUNT_HEADER, "Invalid acting account id")
-        return self._parse_identity_header(request, LEGACY_ACTING_ACCOUNT_HEADER, "Invalid acting account id")
+        HERMES_SESSION_ACTING_ACCOUNT_ID), validated like the user id."""
+        return self._parse_identity_header(request, ACTING_ACCOUNT_HEADER, "Invalid acting account id")
 
     def _parse_identity_header(
         self, request: "web.Request", header: str,
