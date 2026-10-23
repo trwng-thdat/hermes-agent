@@ -28622,6 +28622,18 @@
             "default": null,
             "title": "User Id"
           },
+          "acting_account_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Acting Account Id"
+          },
           "helpdesk_account_id": {
             "anyOf": [
               {
@@ -28632,6 +28644,8 @@
               }
             ],
             "default": null,
+            "deprecated": true,
+            "description": "Deprecated: pre-rename name of ``acting_account_id``.",
             "title": "Helpdesk Account Id"
           }
         },
@@ -30029,6 +30043,18 @@
             "default": null,
             "title": "User Id"
           },
+          "acting_account_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Acting Account Id"
+          },
           "helpdesk_account_id": {
             "anyOf": [
               {
@@ -30039,6 +30065,8 @@
               }
             ],
             "default": null,
+            "deprecated": true,
+            "description": "Deprecated: pre-rename name of ``acting_account_id``.",
             "title": "Helpdesk Account Id"
           }
         },

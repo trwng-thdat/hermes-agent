@@ -50,6 +50,13 @@ def _str_param(params: dict, key: str, default: str = "") -> str:
     return str(params.get(key) or "").strip() or default
 
 
+def _acting_account_param(params: dict) -> str:
+    """The chatting user's SSO account id from ``acting_account_id``; callers built before the rename
+    send ``helpdesk_account_id``, read only when the new key is absent (the new name wins)."""
+    key = "acting_account_id" if params.get("acting_account_id") is not None else "helpdesk_account_id"
+    return _str_param(params, key)
+
+
 def _flag(params: dict, name: str) -> bool:
     return is_truthy_value(params.get(name, False))
 
@@ -353,7 +360,7 @@ def _(rid, params: dict) -> dict:
     # HERMES_SESSION_USER_ID via _set_session_context, mirroring how `source`/`cwd` are threaded
     # through. Not authenticated by Hermes itself; the caller is trusted to have verified it upstream.
     hermes_user_id = _str_param(params, "user_id")
-    helpdesk_account_id = _str_param(params, "helpdesk_account_id")
+    acting_account_id = _acting_account_param(params)
     _enable_gateway_prompts()
     session_model_override, create_reasoning_override, create_service_tier_override = _create_overrides(params)
     now = time.time()
@@ -375,7 +382,7 @@ def _(rid, params: dict) -> dict:
             "follow_profile_config": _flag(params, "follow_profile_config"),
             "profile_home": str(profile_home) if profile_home is not None else None,
             "running": False, "session_key": key, "show_reasoning": _load_show_reasoning(), "source": source,
-            "hermes_user_id": hermes_user_id, "helpdesk_account_id": helpdesk_account_id, "slash_worker": None,
+            "hermes_user_id": hermes_user_id, "acting_account_id": acting_account_id, "slash_worker": None,
             "tool_progress_mode": _load_tool_progress_mode(), "tool_started_at": {},
             "transport": current_transport() or _stdio_transport,
             "auth_user_id": _transport_auth_user_id(current_transport())}
@@ -525,7 +532,7 @@ class _Resume:
         # End-user id forwarded by the calling backend (same contract as session.create's ``user_id``). Not
         # authenticated by Hermes; the caller is trusted to have verified it upstream.
         self.hermes_user_id = _str_param(params, "user_id")
-        self.helpdesk_account_id = _str_param(params, "helpdesk_account_id")
+        self.acting_account_id = _acting_account_param(params)
         self.db, self.owns_db, self.found, self.profile_resume_cwd = None, False, None, ""
         self.cols = _int_param(params, "cols", 80)
         # ``profile`` (app-global remote mode): resume from another local profile's state.db.
@@ -555,7 +562,7 @@ class _Resume:
             self.target, cols=self.cols, cwd=cwd, history=history, lease=None, source=source,
             close_on_disconnect=_flag(self.params, "close_on_disconnect"),
             profile_home=self.profile_home, explicit_cwd=bool(self.profile_resume_cwd),
-            hermes_user_id=self.hermes_user_id, helpdesk_account_id=self.helpdesk_account_id, **extra)
+            hermes_user_id=self.hermes_user_id, acting_account_id=self.acting_account_id, **extra)
         if follows_profile:
             record.update(
                 follow_profile_config=True,
@@ -736,7 +743,7 @@ def _resume_reuse_live_locked(ctx: _Resume, sid: str, session: dict) -> dict:
     # of the same company, and tool calls must run as them, not as whoever created the session.
     if ctx.hermes_user_id:
         session["hermes_user_id"] = ctx.hermes_user_id
-        session["helpdesk_account_id"] = ctx.helpdesk_account_id
+        session["acting_account_id"] = ctx.acting_account_id
     _cancel_ws_orphan_reap(sid)  # unconditionally: the fast path must never race the reap Timer
     payload = _live_session_payload(sid, session, cols=ctx.cols, touch=True, omit_messages=ctx.omit_messages,
                                     transport=current_transport() or _stdio_transport)
@@ -873,7 +880,7 @@ def _resume_eager(ctx: _Resume) -> dict:
                 ctx.owns_db = False
             if (session := _sessions.get(sid)) is not None:
                 session["hermes_user_id"] = ctx.hermes_user_id
-                session["helpdesk_account_id"] = ctx.helpdesk_account_id
+                session["acting_account_id"] = ctx.acting_account_id
                 if stored_runtime_overrides.get("model_override") is not None:
                     session["model_override"] = stored_runtime_overrides["model_override"]
                 model_config = _parse_model_config(ctx.found.get("model_config"), quiet=True)
@@ -2032,7 +2039,7 @@ def _build_branch_agent(session: dict, new_sid: str, new_key: str, history: list
             _sessions[new_sid]["auth_user_id"] = parent_user_id
             # A branch continues the parent's conversation, so tools keep running as the same end user.
             _sessions[new_sid]["hermes_user_id"] = session.get("hermes_user_id") or ""
-            _sessions[new_sid]["helpdesk_account_id"] = session.get("helpdesk_account_id") or ""
+            _sessions[new_sid]["acting_account_id"] = session.get("acting_account_id") or ""
         return agent
     finally:
         if branch_owns_db and branch_db is not None:

@@ -1,4 +1,4 @@
-"""A ``forward_session_user`` MCP server receives the chatting user's Helpdesk account id as
+"""A ``forward_session_user`` MCP server receives the chatting user's SSO account id as
 ``_meta["ai.jarvis/actingAccountId"]`` on tools/call; calls without a real end user carry no meta."""
 
 import asyncio
@@ -36,7 +36,7 @@ def _result():
 @pytest.fixture
 def call(monkeypatch):
     """``call(server_name, config, user_id=..., account_id=...) -> (args, kwargs)`` of session.call_tool."""
-    for name in ("HERMES_SESSION_USER_ID", "HERMES_SESSION_HELPDESK_ACCOUNT_ID"):
+    for name in ("HERMES_SESSION_USER_ID", "HERMES_SESSION_ACTING_ACCOUNT_ID"):
         monkeypatch.delenv(name, raising=False)
 
     def _call(server_name, config, *, user_id=None, account_id=""):
@@ -45,7 +45,7 @@ def call(monkeypatch):
         server = SimpleNamespace(session=session, _rpc_lock=None, _config=config)
         reset_session_vars()
         if user_id is not None:
-            set_session_vars(user_id=user_id, helpdesk_account_id=account_id)
+            set_session_vars(user_id=user_id, acting_account_id=account_id)
         with patch.dict(mcp_tool._servers, {server_name: server}), \
              patch("tools.mcp_tool_loop._run_on_mcp_loop", side_effect=_run_inline):
             _mcp_handlers._make_tool_handler(server_name, "list_tickets", 30.0)({"status": "open"})

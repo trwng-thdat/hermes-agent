@@ -1283,7 +1283,7 @@ def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session
         # Live conversation id for subprocess HERMES_SESSION_ID: an explicitly empty contextvar is authoritative
         # (no os.environ fallback), so never leave it "" — agent's durable session_id, then session_key.
         session_id = session_key
-        hermes_user_id = helpdesk_account_id = ""
+        hermes_user_id = acting_account_id = ""
         # A close_on_disconnect session (dashboard/sidecar chat) is reaped the moment its WS drops, and
         # its async-completion drain re-enters results as a *separate* later turn. Left async, a
         # backgrounded delegate_task would surface subagent output straight to the UI while the
@@ -1297,7 +1297,7 @@ def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session
             profile = profile_name_for_home(sess.get("profile_home")) or profile
             session_id = getattr(sess.get("agent"), "session_id", None) or session_key
             hermes_user_id = str(sess.get("hermes_user_id") or "")
-            helpdesk_account_id = str(sess.get("helpdesk_account_id") or "")
+            acting_account_id = str(sess.get("acting_account_id") or "")
             if sess.get("close_on_disconnect"):
                 async_delivery = False
             identity = getattr(sess.get("transport"), "auth_identity", None)
@@ -1310,7 +1310,7 @@ def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session
             browser_control_principal=browser_control_principal,
             browser_control_transport_family=browser_control_transport_family, cwd=resolved,
             ui_session_id=ui_session_id, cron_session="", user_id=hermes_user_id,
-            helpdesk_account_id=helpdesk_account_id, async_delivery=async_delivery)
+            acting_account_id=acting_account_id, async_delivery=async_delivery)
     return []
 
 
@@ -2608,13 +2608,13 @@ def _deferred_session_record(
     close_on_disconnect: bool = False, display_history_prefix: list | None = None,
     profile_home: Path | None = None, lazy: bool = False, model_override=None,
     resume_runtime_overrides: dict | None = None, todo_state: dict | None = None,
-    explicit_cwd: bool = False, hermes_user_id: str = "", helpdesk_account_id: str = "") -> dict:
+    explicit_cwd: bool = False, hermes_user_id: str = "", acting_account_id: str = "") -> dict:
     """A live-session record whose AIAgent is built later (lazy watch / cold resume) — _init_session's shape minus the agent.
 
     ``hermes_user_id`` is the end-user id forwarded by the calling backend (``session.create`` / ``session.resume``
     ``user_id``). A resume rebuilds the record from scratch, so it must be carried here or the rebuilt session
-    loses HERMES_SESSION_USER_ID and MCP tool calls run as the shared runtime-token owner. ``helpdesk_account_id``
-    (HERMES_SESSION_HELPDESK_ACCOUNT_ID) is carried the same way."""
+    loses HERMES_SESSION_USER_ID and MCP tool calls run as the shared runtime-token owner. ``acting_account_id``
+    (HERMES_SESSION_ACTING_ACCOUNT_ID) is carried the same way."""
     now = time.time()
     return {
         "agent": None, "agent_error": None, "agent_ready": threading.Event(), "attached_images": [],
@@ -2631,7 +2631,7 @@ def _deferred_session_record(
         "tool_started_at": {}, "todo_state": todo_state,
         "transport": current_transport() or _stdio_transport,
         "auth_user_id": _transport_auth_user_id(current_transport()),
-        "hermes_user_id": hermes_user_id, "helpdesk_account_id": helpdesk_account_id,
+        "hermes_user_id": hermes_user_id, "acting_account_id": acting_account_id,
     }
 
 

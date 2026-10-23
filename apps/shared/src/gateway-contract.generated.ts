@@ -2773,6 +2773,7 @@ export interface SessionCreateParams {
   room_plumbing?: boolean
   follow_profile_config?: boolean
   user_id?: string | null
+  acting_account_id?: string | null
   helpdesk_account_id?: string | null
 }
 /** One create-time transcript row (``session_history._coerce_seed_history``); ``text`` is the legacy alias of ``content``; only ``display_kind: "hidden"`` is accepted from the wire. Clients forward stored rows verbatim (``_row_id``, ``timestamp``, …) and the coercer drops what it does not use, so the row stays open. */
@@ -2829,6 +2830,7 @@ export interface SessionResumeParams {
   eager_build?: boolean
   close_on_disconnect?: boolean
   user_id?: string | null
+  acting_account_id?: string | null
   helpdesk_account_id?: string | null
 }
 export interface SessionResumeResult {

@@ -618,9 +618,9 @@ class OpenAICompatRoutesMixin:
         user_id, uid_err = self._parse_user_id_header(request)
         if uid_err is not None:
             return uid_err
-        helpdesk_account_id, hd_err = self._parse_helpdesk_account_header(request)
-        if hd_err is not None:
-            return hd_err
+        acting_account_id, acct_err = self._parse_acting_account_header(request)
+        if acct_err is not None:
+            return acct_err
         # X-Hermes-Session-Id continues an existing session (history from state.db, not the body);
         # requires a configured API key or any client could read history by guessing ids.
         provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
@@ -671,7 +671,7 @@ class OpenAICompatRoutesMixin:
             user_message=user_message, conversation_history=history,
             ephemeral_system_prompt=system_prompt, session_id=session_id,
             gateway_session_key=gateway_session_key, **agent_overrides, route=route,
-            user_id=user_id, helpdesk_account_id=helpdesk_account_id, relay_metadata=relay_metadata,
+            user_id=user_id, acting_account_id=acting_account_id, relay_metadata=relay_metadata,
             # #98619: only an explicitly provided X-Hermes-Session-Id is wake-capable (the
             # header is 403-gated on API_SERVER_KEY, so the wake self-post can authenticate
             # and the client can resume the session by sending it again). A fingerprint-derived
@@ -967,9 +967,9 @@ class OpenAICompatRoutesMixin:
         user_id, uid_err = self._parse_user_id_header(request)
         if uid_err is not None:
             return uid_err
-        helpdesk_account_id, hd_err = self._parse_helpdesk_account_header(request)
-        if hd_err is not None:
-            return hd_err
+        acting_account_id, acct_err = self._parse_acting_account_header(request)
+        if acct_err is not None:
+            return acct_err
         try:
             body = await request.json()
         except Exception:
@@ -1060,7 +1060,7 @@ class OpenAICompatRoutesMixin:
             user_message=user_message, conversation_history=conversation_history,
             ephemeral_system_prompt=instructions, session_id=session_id,
             gateway_session_key=gateway_session_key, bind_declared_conversation=_declared_selected,
-            **agent_overrides, route=route, user_id=user_id, helpdesk_account_id=helpdesk_account_id,
+            **agent_overrides, route=route, user_id=user_id, acting_account_id=acting_account_id,
             relay_metadata=relay_metadata)
         if stream:
             _stream_q = ThreadSafeAsyncQueue()

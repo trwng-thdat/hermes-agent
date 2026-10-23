@@ -40,7 +40,7 @@ def _mcp_requires_user_id() -> bool:
 
 
 def _acting_user_meta(server: Any) -> Optional[dict]:
-    """``_meta`` for a ``forward_session_user`` server: the session's Helpdesk account id ("" = not linked).
+    """``_meta`` for a ``forward_session_user`` server: the chatting user's SSO account id ("" = not linked).
     None (no meta, the server acts as its token owner) without a real end user, e.g. cron or ``system`` calls."""
     config = getattr(server, "_config", None)
     if not isinstance(config, dict) or config.get("forward_session_user") is not True:
@@ -49,7 +49,7 @@ def _acting_user_meta(server: Any) -> Optional[dict]:
     user_id = get_session_env("HERMES_SESSION_USER_ID").strip()
     if not user_id or user_id == "system":
         return None
-    return {_ACTING_ACCOUNT_META_KEY: get_session_env("HERMES_SESSION_HELPDESK_ACCOUNT_ID").strip()}
+    return {_ACTING_ACCOUNT_META_KEY: get_session_env("HERMES_SESSION_ACTING_ACCOUNT_ID").strip()}
 
 declaration.on_change = invalidate_check_fn_cache
 

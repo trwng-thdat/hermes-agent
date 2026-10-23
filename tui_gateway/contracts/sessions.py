@@ -134,8 +134,11 @@ class SessionCreateParams(ProfileParams):
     # HERMES_SESSION_USER_ID every turn (see methods_session.py::session.create). The handler
     # reads it via _str_param, so the contract must declare it or extra="forbid" answers 4000.
     user_id: str | None = None
-    # That user's Helpdesk account id, re-bound as HERMES_SESSION_HELPDESK_ACCOUNT_ID ("" = not linked).
-    helpdesk_account_id: str | None = None
+    # The chatting user's SSO account id, re-bound as HERMES_SESSION_ACTING_ACCOUNT_ID ("" = not linked).
+    acting_account_id: str | None = None
+    # Pre-rename name of ``acting_account_id``, still accepted from older callers (the new name wins).
+    helpdesk_account_id: str | None = Field(
+        default=None, deprecated=True, description="Deprecated: pre-rename name of ``acting_account_id``.")
 
 
 class SessionCreateResult(Result):
@@ -164,7 +167,9 @@ class SessionResumeParams(SessionParams):
     eager_build: bool = False
     close_on_disconnect: bool = False
     user_id: str | None = None  # same contract as session.create
-    helpdesk_account_id: str | None = None
+    acting_account_id: str | None = None
+    helpdesk_account_id: str | None = Field(
+        default=None, deprecated=True, description="Deprecated: pre-rename name of ``acting_account_id``.")
 
 
 class SessionResumeResult(LiveSessionSnapshot):
