@@ -2268,6 +2268,8 @@ class _CronRunScope:
     HERMES_SESSION_* are deliberately NOT seeded from job["origin"]: it is delivery metadata, not
     a sender, and terminal/tts/skills/send_message tools would act as if the origin user were
     driving the agent. Delivery reads job["origin"] / HERMES_CRON_AUTO_DELIVER_* directly.
+    Only the explicit job["user_id"] / job["acting_account_id"] (set by whoever created the job)
+    bind the run to an end user, the same way a chat turn's headers do.
     """
 
     def __init__(self, job: dict, job_id: str, execution_id: Optional[str]):
@@ -2294,6 +2296,8 @@ class _CronRunScope:
             # #53027, #63142.
             async_delivery=False,
             cwd=self.workdir or "",
+            user_id=job.get("user_id") or "",
+            acting_account_id=job.get("acting_account_id") or "",
         )
         for name in _CRON_DELIVERY_VARS:
             _VAR_MAP[name].set("")

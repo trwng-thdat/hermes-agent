@@ -313,6 +313,8 @@ class CronJobCreate(BaseModel):
     enabled_toolsets: Optional[List[str]] = None
     workdir: Optional[str] = None
     no_agent: bool = False
+    user_id: Optional[str] = None
+    acting_account_id: Optional[str] = None
 
 class CronJobUpdate(BaseModel):
     updates: dict
