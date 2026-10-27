@@ -730,7 +730,8 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
 
     Local/CLI keep the raw diagnostic stream; messaging surfaces drop transient aux/compression noise."""
     text = str(message or "").strip()
-    if not text:
+    # Claim-gate control event for streaming clients (tui_gateway), never a chat bubble.
+    if not text or event_type == "answer_retracted":
         return None
     if _gateway_surface_passes_raw_text(platform):
         return text

@@ -1,9 +1,10 @@
 """Text-response stop gates for the conversation turn loop.
 
-When the model stops with a text answer, three gates may instead append the answer as an
+When the model stops with a text answer, four gates may instead append the answer as an
 interim row plus a synthetic user-role nudge and continue the turn: verify-on-stop (#65919),
-the ``pre_verify`` plugin hook after code edits, and the kanban worker terminal-tool guard.
-Each keeps the candidate answer as a budget-exhaustion fallback
+the ``pre_verify`` plugin hook after code edits, the kanban worker terminal-tool guard, and the
+chat claim gate (``agent.claim_stop``), which retracts an unsupported answer instead.
+The first three keep the candidate answer as a budget-exhaustion fallback
 (``pending_verification_response``) and clears ``final_response`` so the finalizer can tell
 this gate from error exits (#61631). Nothing here imports ``agent.conversation_loop`` at
 module level (cycle).
@@ -91,6 +92,43 @@ def _kanban_stop_nudge(agent, messages) -> Optional[str]:
         return None
 
 
+def _claim_stop_nudge(
+    agent, messages, final_response, current_turn_user_idx, api_call_count
+) -> Optional[str]:
+    """Chat answers must be backed by this turn's tool results (agent.claim_stop). Skipped once
+    the cap is hit, on interrupt, and when the budget can't fund another call — so the budget
+    fallback never meets a retracted answer."""
+    try:
+        from agent.claim_stop import (
+            build_claim_nudge, check_answer, claim_gate_enabled, claim_judge_enabled, max_claim_nudges
+        )
+
+        if not final_response or not claim_gate_enabled(agent):
+            return None
+        attempts = getattr(agent, "_claim_stop_nudges", 0)
+        if attempts >= max_claim_nudges() or getattr(agent, "_interrupt_requested", False):
+            return None
+        budget = getattr(agent, "iteration_budget", None)
+        if (api_call_count or 0) + 1 >= agent.max_iterations or (
+            budget is not None and budget.remaining <= 1
+        ):
+            return None
+        if current_turn_user_idx is None:
+            from agent.turn_context import reanchor_current_turn_user_idx
+            current_turn_user_idx = reanchor_current_turn_user_idx(messages, None)
+        hit = check_answer(
+            agent, messages, final_response, current_turn_user_idx, judge=claim_judge_enabled()
+        )
+        if hit is None:
+            return None
+        kind, detail = hit
+        logger.info("claim gate nudge issued (attempt %d) kind=%s detail=%s", attempts + 1, kind, detail)
+        return build_claim_nudge(kind, detail)
+    except Exception:
+        logger.info("claim gate check failed open", exc_info=True)
+        return None
+
+
 def _append_interim_answer(agent, final_msg, messages, conversation_history, flush_fail_msg: str) -> None:
     """Real content: persist and emit as interim so the user sees the attempted answer;
     only the nudge is flagged synthetic (#65919)."""
@@ -105,17 +143,25 @@ def _append_interim_answer(agent, final_msg, messages, conversation_history, flu
 def apply_stop_gates(
     agent: Any, final_msg: Dict[str, Any], *, final_response: Any, messages: List[Dict[str, Any]],
     conversation_history: Any, pending_verification_response: Any,
-    pending_verification_response_previewed: Any,
+    pending_verification_response_previewed: Any, current_turn_user_idx: Any = None,
+    api_call_count: Any = None,
 ) -> StopGateVerdict:
-    """Run verify-on-stop → pre_verify hook → kanban stop guard, in that order. Nudges
+    """Run verify-on-stop → pre_verify hook → kanban stop guard → claim gate, in that order. Nudges
     are user-role rows appended only after the assistant answer row, so role alternation
     holds. Hook lookups are imported lazily from their origin modules (tests patch them
     there)."""
 
-    def _continue(nudge: str, flag: str) -> StopGateVerdict:
+    def _continue(nudge: str, flag: str, *, fallback: bool = True) -> StopGateVerdict:
         """Append the synthetic nudge row and hand the turn back to the loop."""
         append_message(messages, {"role": "user", "content": nudge, flag: True})
         agent._session_messages = messages
+        if not fallback:
+            # A retracted answer must never come back as the budget fallback.
+            return StopGateVerdict(
+                continue_turn=True, final_response=None,
+                pending_verification_response=pending_verification_response,
+                pending_verification_response_previewed=pending_verification_response_previewed,
+            )
         # Keep the answer only as a budget-exhaustion fallback; clear ``final_response`` so
         # the finalizer can tell this gate from error exits. Mark previewed only if the
         # candidate is reused (#61631).
@@ -167,6 +213,21 @@ def apply_stop_gates(
             "⚠️ Kanban worker tried to exit without a terminal board call "
             "(kanban_complete/kanban_request_review/kanban_block) — nudging to finish"
         )
+        return verdict
+
+    _claim_nudge = _claim_stop_nudge(agent, messages, final_response, current_turn_user_idx, api_call_count)
+    if _claim_nudge:
+        agent._claim_stop_nudges = getattr(agent, "_claim_stop_nudges", 0) + 1
+        # Retracted: in context for the retry only — never persisted, emitted as interim or
+        # reused as the fallback; the client drops the text it already streamed.
+        final_msg["finish_reason"] = "claim_check_required"
+        final_msg["_claim_rejected"] = True
+        append_message(messages, final_msg)
+        verdict = _continue(_claim_nudge, "_claim_stop_synthetic", fallback=False)
+        try:
+            agent._emit_status_kind("answer_retracted", "answer retracted", origin="claim_gate")
+        except Exception:
+            logger.debug("answer_retracted status emit failed", exc_info=True)
         return verdict
     return StopGateVerdict(
         continue_turn=False, final_response=final_response,

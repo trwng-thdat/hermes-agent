@@ -414,6 +414,13 @@ TASK_COMPLETION_GUIDANCE = (
     "produce. Reporting a blocker honestly is always better than inventing a result."
 )
 
+# Standing grounding rule for chat surfaces; added only where the claim gate (agent.claim_stop) runs.
+GROUNDING_GUIDANCE = (
+    "State a concrete fact (number, name, status, ID, date, link, record content) only if it came from a "
+    "tool result, the user, or your instructions. Otherwise look it up with a tool or say you don't know. "
+    "Never report an action as done unless a tool call returned success."
+)
+
 # Universal parallel-tool-call guidance (ALL models): the runtime already executes independent calls
 # concurrently. Supersedes the former Google-only bullet so no model receives the steer twice.
 # Why this matters for cost: every assistant turn resends the entire accumulated conversation (and, on

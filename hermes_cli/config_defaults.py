@@ -199,6 +199,14 @@ DEFAULT_CONFIG = {
         # force on everywhere; "auto" = on for interactive coding surfaces and programmatic callers,
         # off for messaging surfaces. Doc/markdown/skill-only edits never fire.
         "verify_on_stop": False,
+        # Chat claim gate (agent/claim_stop.py): before a text answer ends the turn, retract it and
+        # nudge the agent when it claims an action no write tool completed, or (judge) states facts
+        # its tool results contradict or nothing sources. "auto" = ai-claw dashboard chat / TUI /
+        # desktop only (off for cron, subagents, kanban workers, messaging); true/false force.
+        # HERMES_CLAIM_GATE env wins. claim_judge=false keeps the regex rule only (HERMES_CLAIM_JUDGE).
+        "claim_gate": "auto",
+        "claim_judge": True,
+        "max_claim_nudges": 2,
         # Inactivity warning (seconds), once per run before gateway_timeout; no interrupt. 0 = off.
         "gateway_timeout_warning": 900,
         # Max seconds any surface (CLI, TUI/Desktop, messaging gateway) blocks an agent awaiting a
@@ -773,6 +781,7 @@ DEFAULT_CONFIG = {
         "kanban_decomposer": _aux(180),
         "profile_describer": _aux(60),   # 1-2 sentence profile blurb; short, cheap
         "goal_judge": _aux(60),          # /goal satisfaction + contract drafting; JSON calls
+        "claim_gate": _aux(10),          # chat answer grounding judge; runs before `done`, keep it fast
         # Curator skill-usage review can take minutes on reasoning models (umbrellas over hundreds
         # of skills); route cheaper via `hermes model` → auxiliary → Curator.
         "curator": _aux(600),

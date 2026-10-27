@@ -23,7 +23,9 @@ from agent.served_model import result_model_fields
 # Verification-continuation nudges (verify-on-stop / pre_verify) must be stripped from
 # returned/live history to avoid role-alternation breaks; the assistant response is
 # real content and is not flagged. (#65919)
-_VERIFICATION_CONTINUATION_FLAGS = ("_verification_stop_synthetic", "_pre_verify_synthetic")
+_VERIFICATION_CONTINUATION_FLAGS = (
+    "_verification_stop_synthetic", "_pre_verify_synthetic", "_claim_stop_synthetic",
+)
 
 _SENTENCE_END = {".", "!", "?", "。", "！", "？", "`", ")"}
 
@@ -89,6 +91,18 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
         m for m in messages
         if not (isinstance(m, dict) and any(m.get(f) for f in _VERIFICATION_CONTINUATION_FLAGS))
     ]
+    # A claim-gate retracted answer is retry context only: once a later answer was accepted it
+    # must not ride into the next turn's history (it is never persisted either). Without a later
+    # answer it stays, so the live transcript still ends assistant-last.
+    accepted_after = False
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        if not m.get("_claim_rejected"):
+            accepted_after = True
+        elif accepted_after:
+            del messages[i]
 
 
 def _clone_background_review_messages(messages):

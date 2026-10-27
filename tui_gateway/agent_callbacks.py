@@ -93,8 +93,26 @@ def _agent_presentation_enabled(sid: str, *, diagnostic: bool) -> bool:
         return warning_notifications_enabled("tui", getattr((session or {}).get("agent"), "_notification_config", None))
 
 
+def _retract_inflight_answer(sid: str) -> None:
+    """The claim gate retracted the streamed answer: drop it from the live-turn buffer so a
+    resuming client doesn't rebuild it (corrections stay, anchored at the start)."""
+    with _sessions_lock:
+        session = _sessions.get(sid)
+        turn = (session or {}).get("inflight_turn")
+        if isinstance(turn, dict):
+            turn = dict(turn, assistant="", updated_at=time.time())
+            if turn.get("correction_offsets"):
+                turn["correction_offsets"] = [0] * len(turn["correction_offsets"])
+            session["inflight_turn"] = turn
+
+
 def _agent_status_update(sid: str, kind: str, text: str | None = None) -> None:
     from gateway.warning_notifications import is_warning_status
+    if kind == "answer_retracted":
+        # Control event, not a notice: never gated by the presentation preference.
+        _retract_inflight_answer(sid)
+        _status_update(sid, kind, text or "answer retracted")
+        return
     if not _agent_presentation_enabled(sid, diagnostic=is_warning_status(kind, text if text is not None else kind)):
         return
     _status_update(sid, str(kind), None if text is None else str(text))

@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from agent.delegation_context import owned_kanban_task
 from agent.prompt_builder import (
-    DEFAULT_AGENT_IDENTITY, EXECUTION_GUIDANCE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
+    DEFAULT_AGENT_IDENTITY, EXECUTION_GUIDANCE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, GROUNDING_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE, HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS, KANBAN_GUIDANCE,
     KNOWLEDGE_FIRST_GUIDANCE, PARALLEL_TOOL_CALL_GUIDANCE, PLATFORM_HINTS, SESSION_SEARCH_GUIDANCE,
     SKILLS_GUIDANCE, STEER_CHANNEL_NOTE, TASK_COMPLETION_GUIDANCE, TELEGRAM_RICH_MESSAGES_HINT,
@@ -581,6 +581,13 @@ def _guidance_parts(agent: Any) -> List[str]:
     # your tools" steer for information lookups while leaving action commands to
     # call tools normally.
     parts.append(KNOWLEDGE_FIRST_GUIDANCE)
+    # Same scope as the claim gate, so cron / subagent / messaging prompt caches are untouched.
+    try:
+        from agent.claim_stop import claim_gate_enabled
+        if claim_gate_enabled(agent):
+            parts.append(GROUNDING_GUIDANCE)
+    except Exception:
+        logger.debug("claim gate scope check failed", exc_info=True)
     return parts
 
 
