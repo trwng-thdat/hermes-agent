@@ -38,6 +38,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -331,6 +332,16 @@ class TraceState:
     pending_tools_by_name: Dict[str, list] = field(default_factory=dict)
     subagents: Dict[str, Any] = field(default_factory=dict)
     last_updated_at: float = field(default_factory=time.time)
+    # Readability: steps are numbered, tools nest under the step that called them, and each
+    # step's input shows only the messages added since the previous step.
+    step_no: int = 0
+    step_context: Any = None
+    seen_messages: int = 0
+    total_tokens: int = 0
+    tool_count: int = 0
+    tool_errors: int = 0
+    started_at: float = field(default_factory=time.time)
+    step_of: Dict[int, int] = field(default_factory=dict)
 
 
 _STATE_LOCK = threading.Lock()
@@ -406,22 +417,27 @@ def _start_root(task_key: str, *, project: str, tracer: Any, task_id: str, sessi
                 platform: str, provider: str, model: str, api_mode: str, messages: Any,
                 turn_id: str, api_request_id: str) -> TraceState:
     sdk = _load_sdk()
-    span = tracer.start_span("agent turn")
+    last_user = next((m for m in reversed(messages) if isinstance(m, dict) and m.get("role") == "user"), None) \
+        if isinstance(messages, list) else None
+    user_text = _content_text(last_user.get("content")) if last_user is not None else ""
+    span = tracer.start_span(_turn_name(user_text))
     _set_attr(span, _OI_SPAN_KIND, _KIND_CHAIN)
     if session_id:
         _set_attr(span, _OI_SESSION_ID, session_id)
-    last_user = next((m for m in reversed(messages) if isinstance(m, dict) and m.get("role") == "user"), None) \
-        if isinstance(messages, list) else None
     if last_user is not None:
-        _set_attr(span, _OI_INPUT_VALUE, _capture_json({"role": "user", "content": last_user.get("content")}))
-        _set_attr(span, _OI_INPUT_MIME, _MIME_JSON)
+        _set_attr(span, _OI_INPUT_VALUE, _capture_text(user_text))
+        _set_attr(span, _OI_INPUT_MIME, _MIME_TEXT)
     _set_metadata(span, {
-        "source": "hermes", "task_id": task_id, "turn_id": turn_id, "api_request_id": api_request_id,
-        "platform": platform, "provider": provider, "model": model, "api_mode": api_mode,
-        "project": project, "capture_mode": _capture_mode(),
+        "source": "hermes", "profile": _profile_name(), "task_id": task_id, "turn_id": turn_id,
+        "api_request_id": api_request_id, "platform": platform, "provider": provider, "model": model,
+        "api_mode": api_mode, "project": project, "capture_mode": _capture_mode(),
     })
     context = sdk["set_span_in_context"](span)
     state = TraceState(project=project, root_span=span, context=context)
+    # Step 1's input starts at the user message: the system prompt and history are the same for
+    # every step, so they show once, as step 1's system message, not on every step.
+    if isinstance(messages, list) and last_user is not None:
+        state.seen_messages = len(messages) - 1 - messages[::-1].index(last_user)
     # Attach any pre-turn gate verdict (JEV) stashed for this session as the
     # first child of the turn.
     pending = _PENDING_GATES.pop(session_id, None) if session_id else None
@@ -448,11 +464,12 @@ def _get_or_start_state_locked(task_key: str, **root_kwargs: Any) -> TraceState:
     return state
 
 
-def _start_child(state: TraceState, *, name: str, kind: str) -> Any:
+def _start_child(state: TraceState, *, name: str, kind: str, context: Any = None,
+                 start_time: Optional[int] = None) -> Any:
     tracer = _TRACERS.get(state.project)
     if tracer is None:
         return None
-    span = tracer.start_span(name, context=state.context)
+    span = tracer.start_span(name, context=context or state.context, start_time=start_time)
     _set_attr(span, _OI_SPAN_KIND, kind)
     return span
 
@@ -491,9 +508,19 @@ def _finish_trace(task_key: str, *, output: Any = None, error: bool = False, sta
         return
     with _failsafe("finish trace"):
         _end_children(state)
-        if output is not None:
+        if isinstance(output, str):
+            _set_attr(state.root_span, _OI_OUTPUT_VALUE, _capture_text(output))
+            _set_attr(state.root_span, _OI_OUTPUT_MIME, _MIME_TEXT)
+        elif output is not None:
             _set_attr(state.root_span, _OI_OUTPUT_VALUE, _capture_json(output))
             _set_attr(state.root_span, _OI_OUTPUT_MIME, _MIME_JSON)
+        if state.total_tokens:
+            _set_attr(state.root_span, _OI_LLM_TOKENS_TOTAL, state.total_tokens)
+        errors = f" ({state.tool_errors} lỗi)" if state.tool_errors else ""
+        tokens = f" · {state.total_tokens} tok" if state.total_tokens else ""
+        _set_attr(state.root_span, "hermes.summary",
+                  f"{state.step_no} bước · {state.tool_count} tool{errors} · "
+                  f"{round(time.time() - state.started_at, 1)}s{tokens}")
         if error:
             _mark_error(state.root_span, status_message)
         _end_span(state.root_span)
@@ -556,6 +583,162 @@ def _serialize_assistant(assistant_message: Any, assistant_response: Any,
     }
 
 
+# ── readable naming / content (what a reader of the Phoenix tree needs) ─────────
+_MCP_NAME = re.compile(r"^mcp__(?P<server>.+?)__(?P<tool>.+)$")
+_META_TOOLS = frozenset({"tool_call"})  # dispatchers whose real target sits in args["calls"]
+_REASONING_PREVIEW = 1500
+
+
+def _content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(str(p.get("text") or "") for p in content if isinstance(p, dict) and p.get("text"))
+    return "" if content is None else str(content)
+
+
+def _one_line(text: str, limit: int) -> str:
+    text = " ".join((text or "").split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _turn_name(user_text: str) -> str:
+    if _capture_mode() == "metadata" or not user_text.strip():
+        return "agent turn"
+    return f"{_one_line(_redact(user_text), 70)}"
+
+
+def _profile_name() -> str:
+    home = _env("HERMES_HOME")
+    return os.path.basename(home.rstrip("/\\")) if home else ""
+
+
+def _short_tool(name: str) -> str:
+    """``mcp__helpdesk__get_x`` → ``helpdesk.get_x``."""
+    m = _MCP_NAME.match(name or "")
+    return f"{m.group('server')}.{m.group('tool')}" if m else (name or "tool")
+
+
+def _parse_args(args: Any) -> Any:
+    if isinstance(args, str):
+        try:
+            return json.loads(args)
+        except ValueError:
+            return args
+    return args
+
+
+def _tool_targets(name: str, args: Any) -> list:
+    """``[(real_tool_name, its_args)]``: a ``tool_call`` dispatcher is unwrapped to its calls."""
+    args = _parse_args(args)
+    if name in _META_TOOLS and isinstance(args, dict) and isinstance(args.get("calls"), list):
+        calls = [c for c in args["calls"] if isinstance(c, dict) and c.get("name")]
+        if calls:
+            return [(str(c["name"]), c.get("arguments")) for c in calls]
+    return [(name, args)]
+
+
+def _tool_label(name: str, args: Any) -> str:
+    return ", ".join(_short_tool(n) for n, _ in _tool_targets(name, args))
+
+
+def _deep_parse(value: Any, depth: int = 0) -> Any:
+    """JSON-encoded strings nested anywhere in a result become objects (no ``\\"`` walls)."""
+    if depth > 12:
+        return value
+    if isinstance(value, str) and value[:1] in "{[":
+        parsed = _parse_args(value)
+        return _deep_parse(parsed, depth + 1) if isinstance(parsed, (dict, list)) else value
+    if isinstance(value, dict):
+        return {k: _deep_parse(v, depth + 1) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_deep_parse(v, depth + 1) for v in value]
+    return value
+
+
+def _unwrap_result(result: Any) -> Any:
+    """Parse JSON strings, and ``{"result": "<json>"}`` envelopes, so results read as objects."""
+    result = _deep_parse(_parse_args(result))
+    if isinstance(result, dict) and set(result) == {"result"} and isinstance(result["result"], (dict, list)):
+        return result["result"]
+    return result
+
+
+def _tool_error(result: Any) -> str:
+    """The failure message of a tool result, or "" when it succeeded."""
+    data = _unwrap_result(result)
+    if isinstance(data, dict):
+        if data.get("error"):
+            err = data["error"]
+            return err if isinstance(err, str) else json.dumps(err, default=str, ensure_ascii=False)
+        status = str(data.get("status") or "").lower()
+        if status in {"error", "failed", "failure"}:
+            return str(data.get("message") or status)
+    return ""
+
+
+def _call_parts(tc: Any) -> tuple:
+    """``(name, arguments)`` from an OpenAI-style or Hermes tool-call object/dict."""
+    if isinstance(tc, dict):
+        fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
+        return str(fn.get("name") or ""), _parse_args(fn.get("arguments"))
+    fn = getattr(tc, "function", None) or tc
+    return str(getattr(fn, "name", "") or ""), _parse_args(getattr(fn, "arguments", None))
+
+
+def _set_messages(span: Any, prefix: str, messages: list) -> None:
+    """OpenInference ``llm.{input,output}_messages`` so Phoenix renders a chat view."""
+    for i, msg in enumerate(messages):
+        base = f"{prefix}.{i}.message"
+        _set_attr(span, f"{base}.role", str(msg.get("role") or ""))
+        text = _content_text(msg.get("content"))
+        if text:
+            _set_attr(span, f"{base}.content", _capture_text(text))
+        for j, tc in enumerate(msg.get("tool_calls") or []):
+            name, arguments = _call_parts(tc)
+            _set_attr(span, f"{base}.tool_calls.{j}.tool_call.function.name", name)
+            _set_attr(span, f"{base}.tool_calls.{j}.tool_call.function.arguments", _capture_json(arguments))
+
+
+def _input_digest(messages: list) -> str:
+    """One readable block per new message: who said what since the previous step."""
+    rows = []
+    for msg in messages:
+        role = str(msg.get("role") or "")
+        text = _content_text(msg.get("content")).strip()
+        if role == "system":
+            rows.append(f"[system prompt · {len(text)} chars]")
+        elif role == "tool":
+            label = _short_tool(str(msg.get("name") or msg.get("tool_name") or "tool"))
+            rows.append(f"tool {label} →\n{text}")
+        elif role == "assistant" and msg.get("tool_calls") and not text:
+            continue
+        elif text:
+            rows.append(f"{'user' if role == 'user' else role}:\n{text}")
+    return "\n\n".join(rows)
+
+
+def _decision(output: Dict[str, Any]) -> tuple:
+    """``(short_label, readable_text)`` of what one LLM step decided."""
+    calls = [_call_parts(tc) for tc in output.get("tool_calls") or []]
+    reasoning = _content_text(output.get("reasoning")).strip()
+    content = _content_text(output.get("content")).strip()
+    parts = []
+    if reasoning:
+        parts.append("Reasoning: " + (reasoning if len(reasoning) <= _REASONING_PREVIEW
+                              else reasoning[:_REASONING_PREVIEW] + " …"))
+    if calls:
+        for name, arguments in calls:
+            for target, target_args in _tool_targets(name, arguments):
+                parts.append(f"→ {_short_tool(target)} {json.dumps(target_args, default=str, ensure_ascii=False)}")
+        label = "→ " + ", ".join(_tool_label(n, a) for n, a in calls)
+    else:
+        label = "Trả lời"
+    if content:
+        parts.append(content)
+    return label, "\n\n".join(parts)
+
+
 # ── hooks ─────────────────────────────────────────────────────────────────────
 def on_pre_llm_call(*, task_id: str = "", session_id: str = "", platform: str = "", model: str = "",
                     provider: str = "", api_mode: str = "", messages: Any = None,
@@ -605,19 +788,25 @@ def on_pre_llm_request(*, task_id: str = "", session_id: str = "", platform: str
         previous = state.generations.pop(req_key, None)
         if previous is not None:
             _end_span(previous)
-        span = _start_child(state, name=f"LLM call {api_call_count}", kind=_KIND_LLM)
+        state.step_no += 1
+        span = _start_child(state, name=f"{state.step_no}. Suy nghĩ…", kind=_KIND_LLM)
         if span is not None:
             _set_attr(span, _OI_LLM_MODEL, model)
             _set_attr(span, _OI_LLM_PROVIDER, provider)
-            if system_prompt:
-                _set_attr(span, _OI_LLM_SYSTEM, _capture_text(str(system_prompt)))
-            if input_messages:
-                _set_attr(span, _OI_INPUT_VALUE, _capture_json(input_messages))
-                _set_attr(span, _OI_INPUT_MIME, _MIME_JSON)
-            _set_metadata(span, {"provider": provider, "platform": platform, "api_mode": api_mode,
-                                 "base_url": base_url, "message_count": message_count,
-                                 "approx_input_tokens": approx_input_tokens})
+            if isinstance(input_messages, list):
+                # Only what is new since the previous step; step 1 also carries the system prompt.
+                new = [m for m in input_messages[state.seen_messages:] if isinstance(m, dict)]
+                if state.step_no == 1 and system_prompt:
+                    new = [{"role": "system", "content": str(system_prompt)}] + new
+                state.seen_messages = len(input_messages)
+                _set_messages(span, "llm.input_messages", new)
+                _set_attr(span, _OI_INPUT_VALUE, _capture_text(_input_digest(new)))
+                _set_attr(span, _OI_INPUT_MIME, _MIME_TEXT)
+            _set_metadata(span, {"step": state.step_no, "api_call": api_call_count, "provider": provider,
+                                 "platform": platform, "api_mode": api_mode, "base_url": base_url,
+                                 "message_count": message_count, "approx_input_tokens": approx_input_tokens})
             state.generations[req_key] = span
+            state.step_of[id(span)] = state.step_no
 
 
 def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str = "", base_url: str = "",
@@ -627,6 +816,11 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
                      assistant_response: Any = None, turn_id: str = "", api_request_id: str = "",
                      response_model: Any = None, **_: Any) -> None:
     task_key = _trace_key(task_id, session_id, turn_id=turn_id, api_request_id=api_request_id)
+    # The turn-level post_llm_call (turn_finalizer: no api_call_count / api_request_id) fires once
+    # after the whole loop, gate retries included, so it is what ends the turn's trace.
+    if not api_call_count and not api_request_id and assistant_message is None:
+        _finish_trace(task_key, output=_content_text(assistant_response) or None)
+        return
     with _STATE_LOCK:
         state = _TRACE_STATE.get(task_key)
         generation = state.generations.pop(_request_key(api_call_count), None) if state else None
@@ -638,22 +832,30 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
 
     output = _serialize_assistant(assistant_message, assistant_response, assistant_content_chars,
                                   assistant_tool_call_count)
+    label, text = _decision(output)
+    tokens = _extract_tokens(response, usage)
     with _failsafe("end generation"):
+        generation.update_name(f"{state.step_of.pop(id(generation), state.step_no)}. {label}")
         _set_attr(generation, _OI_LLM_MODEL, model)
-        _set_attr(generation, _OI_OUTPUT_VALUE, _capture_json(output))
-        _set_attr(generation, _OI_OUTPUT_MIME, _MIME_JSON)
-        for key, value in _extract_tokens(response, usage).items():
+        _set_attr(generation, _OI_OUTPUT_VALUE, _capture_text(text))
+        _set_attr(generation, _OI_OUTPUT_MIME, _MIME_TEXT)
+        _set_messages(generation, "llm.output_messages", [{
+            "role": "assistant", "content": output.get("content"), "tool_calls": output.get("tool_calls"),
+        }])
+        for key, value in tokens.items():
             _set_attr(generation, key, value)
         _set_metadata(generation, {
             "tool_call_count": len(output.get("tool_calls", [])) or assistant_tool_call_count,
             "finish_reason": finish_reason or None,
             "api_duration_s": round(api_duration, 3) if api_duration and api_duration > 0 else None,
+            "reasoning_chars": len(_content_text(output.get("reasoning"))) or None,
         })
         _end_span(generation)
-
-    has_tools = bool(getattr(assistant_message, "tool_calls", None)) if assistant_message else assistant_tool_call_count > 0
-    if not has_tools and output.get("content"):
-        _finish_trace(task_key, output=output)
+    sdk = _load_sdk()
+    with _STATE_LOCK:
+        state.total_tokens += tokens.get(_OI_LLM_TOKENS_TOTAL, 0)
+        # Tools this step asked for nest under it.
+        state.step_context = sdk["set_span_in_context"](generation) if sdk and output.get("tool_calls") else None
 
 
 def on_pre_tool_call(*, tool_name: str = "", args: Any = None, task_id: str = "",
@@ -664,13 +866,19 @@ def on_pre_tool_call(*, tool_name: str = "", args: Any = None, task_id: str = ""
         state = _TRACE_STATE.get(task_key)
         if state is None:
             return
-        span = _start_child(state, name=f"Tool: {tool_name}", kind=_KIND_TOOL)
+        targets = _tool_targets(tool_name, args)
+        span = _start_child(state, name=_tool_label(tool_name, args), kind=_KIND_TOOL,
+                            context=state.step_context)
         if span is None:
             return
-        _set_attr(span, _OI_TOOL_NAME, tool_name)
-        _set_attr(span, _OI_INPUT_VALUE, _capture_json(args))
+        state.tool_count += 1
+        # A tool_call dispatcher shows its real target and that target's arguments.
+        real_name, real_args = targets[0] if len(targets) == 1 else (tool_name, _parse_args(args))
+        _set_attr(span, _OI_TOOL_NAME, real_name)
+        _set_attr(span, _OI_INPUT_VALUE, _capture_json(real_args))
         _set_attr(span, _OI_INPUT_MIME, _MIME_JSON)
-        _set_metadata(span, {"tool_name": tool_name, "tool_call_id": tool_call_id})
+        _set_metadata(span, {"tool_name": real_name, "dispatcher": tool_name if real_name != tool_name else None,
+                             "tool_call_id": tool_call_id})
         if tool_call_id:
             state.tools[tool_call_id] = span
         else:
@@ -693,9 +901,20 @@ def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = No
                 state.pending_tools_by_name.pop(tool_name, None)
     if span is None:
         return
+    error = _tool_error(result)
     with _failsafe("end tool"):
-        _set_attr(span, _OI_OUTPUT_VALUE, _capture_json(result))
-        _set_attr(span, _OI_OUTPUT_MIME, _MIME_JSON)
+        if error:
+            # A failure reads as its message, as plain text.
+            _set_attr(span, _OI_OUTPUT_VALUE, _capture_text(f"ERROR: {error}"))
+            _set_attr(span, _OI_OUTPUT_MIME, _MIME_TEXT)
+        else:
+            _set_attr(span, _OI_OUTPUT_VALUE, _capture_json(_unwrap_result(result)))
+            _set_attr(span, _OI_OUTPUT_MIME, _MIME_JSON)
+        if error:
+            # Red in Phoenix, with the reason on the span.
+            _mark_error(span, _one_line(error, 200))
+            with _STATE_LOCK:
+                state.tool_errors += 1
         _end_span(span)
 
 
@@ -818,6 +1037,74 @@ def on_pre_turn_gate(*, gate: str = "", session_id: str = "", platform: str = ""
             _PENDING_GATES.pop(key, None)
 
 
+def on_claim_gate(*, task_id: str = "", session_id: str = "", turn_id: str = "", answer: Any = "",
+                  verdict: str = "", detail: Any = None, rule_hit: Any = None, judge: str = "",
+                  judge_error: str = "", duration_ms: Any = None, nudge: Any = None, attempt: Any = None,
+                  judge_input: Any = None, judge_reply: Any = None, judge_started: Any = None,
+                  judge_ended: Any = None, **_: Any) -> None:
+    """The chat claim gate (agent.claim_stop) checked a final answer before the turn ends: one
+    GUARDRAIL span with the verdict, how the judge went, and the nudge sent back if any."""
+    with _STATE_LOCK:
+        state = _TRACE_STATE.get(_trace_key(task_id, session_id, turn_id=turn_id)) or _state_for_turn(turn_id)
+    if state is None:
+        return
+    ms = duration_ms if isinstance(duration_ms, (int, float)) and duration_ms > 0 else 0
+    outcome = f"{verdict} → nudge" if nudge else "OK"
+    judge_note = f" · judge {judge}" if judge and judge != "ok" else ""
+    span = _start_child(state, name=f"Claim gate: {outcome}{judge_note}", kind=_KIND_GUARDRAIL,
+                        start_time=time.time_ns() - int(ms * 1_000_000))
+    if span is None:
+        return
+    with _failsafe("claim gate span"):
+        _set_attr(span, _OI_INPUT_VALUE, _capture_text(_content_text(answer)))
+        _set_attr(span, _OI_INPUT_MIME, _MIME_TEXT)
+        _set_attr(span, _OI_OUTPUT_VALUE, _capture_text(str(nudge)) if nudge else "OK — answer accepted")
+        _set_attr(span, _OI_OUTPUT_MIME, _MIME_TEXT)
+        _set_metadata(span, {"verdict": verdict or "OK", "detail": detail, "rule_hit": rule_hit,
+                             "judge": judge, "judge_error": judge_error or None,
+                             "duration_ms": round(ms, 1) if ms else None, "attempt": attempt})
+        if judge_input is not None:
+            _emit_judge_span(state, span, judge_input=judge_input, judge_reply=judge_reply,
+                             judge=judge, judge_error=judge_error, started=judge_started, ended=judge_ended)
+        _end_span(span)
+
+
+def _emit_judge_span(state: TraceState, gate_span: Any, *, judge_input: Any, judge_reply: Any, judge: str,
+                     judge_error: str, started: Any, ended: Any) -> None:
+    """The judge's own LLM call, nested under the claim gate: what it read and what it answered."""
+    sdk = _load_sdk()
+    if sdk is None:
+        return
+    start_ns = int(started * 1e9) if isinstance(started, (int, float)) else None
+    end_ns = int(ended * 1e9) if isinstance(ended, (int, float)) else None
+    name = "Judge" + (f" ({judge})" if judge and judge != "ok" else "")
+    span = _start_child(state, name=name, kind=_KIND_LLM, context=sdk["set_span_in_context"](gate_span),
+                        start_time=start_ns)
+    if span is None:
+        return
+    try:
+        from agent.claim_stop import _JUDGE_INSTRUCTIONS as instructions
+    except Exception:
+        instructions = ""
+    reply = _parse_args(judge_reply) if judge_reply else None
+    _set_messages(span, "llm.input_messages", [{"role": "system", "content": instructions},
+                                               {"role": "user", "content": str(judge_input)}])
+    _set_attr(span, _OI_INPUT_VALUE, _capture_text(str(judge_input)))
+    _set_attr(span, _OI_INPUT_MIME, _MIME_TEXT)
+    if isinstance(reply, (dict, list)):
+        _set_attr(span, _OI_OUTPUT_VALUE, _capture_json(reply))
+        _set_attr(span, _OI_OUTPUT_MIME, _MIME_JSON)
+    else:
+        _set_attr(span, _OI_OUTPUT_VALUE, _capture_text(str(judge_reply or f"ERROR: {judge_error or judge}")))
+        _set_attr(span, _OI_OUTPUT_MIME, _MIME_TEXT)
+    if judge_reply:
+        _set_messages(span, "llm.output_messages", [{"role": "assistant", "content": str(judge_reply)}])
+    if judge != "ok":
+        _mark_error(span, judge_error or judge)
+    with _failsafe("judge span end"):
+        span.end(end_time=end_ns)
+
+
 def register(ctx) -> None:
     # Both hook-name variants so the plugin works across Hermes versions:
     # *_api_request fire per API call (preferred); *_llm_call once per turn.
@@ -828,6 +1115,7 @@ def register(ctx) -> None:
         ("post_tool_call", on_post_tool_call), ("on_session_finalize", on_session_finalize),
         ("on_session_end", on_session_finalize), ("subagent_start", on_subagent_start),
         ("subagent_stop", on_subagent_stop), ("pre_turn_gate", on_pre_turn_gate),
+        ("claim_gate", on_claim_gate),
     )
     for name, fn in hooks:
         ctx.register_hook(name, fn)
