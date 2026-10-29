@@ -127,7 +127,10 @@ def _claim_stop_nudge(
             kind, detail = hit
             logger.info("claim gate nudge issued (attempt %d) kind=%s detail=%s", attempts + 1, kind, detail)
             done, failed = turn_writes(turn_tool_results(messages, current_turn_user_idx))
-            nudge = build_claim_nudge(kind, detail, done_writes=done, failed_writes=failed)
+            idx = current_turn_user_idx if isinstance(current_turn_user_idx, int) else -1
+            user_msg = messages[idx] if 0 <= idx < len(messages) else None
+            user_text = str(user_msg.get("content") or "") if isinstance(user_msg, dict) else ""
+            nudge = build_claim_nudge(kind, detail, done_writes=done, failed_writes=failed, user_text=user_text)
         _emit_claim_gate_hook(agent, final_response, hit, nudge, attempts + 1, started)
         return nudge
     except Exception:

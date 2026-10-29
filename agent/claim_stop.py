@@ -23,7 +23,7 @@ _TRUTHY_TOKENS = {"1", "true", "yes", "on"}
 # local TUI/desktop. Cron, delegate children, kanban workers and messaging platforms stay off.
 _AUTO_PLATFORMS = frozenset({"tui", "desktop", "tool"})
 _DEFAULT_MAX_NUDGES = 2
-_DEFAULT_JUDGE_TIMEOUT = 10.0
+_DEFAULT_JUDGE_TIMEOUT = 20.0
 
 ToolResult = Tuple[str, bool, str]
 
@@ -227,9 +227,9 @@ def turn_tool_results(messages: Sequence[Any], start_idx: int) -> List[ToolResul
 _VERDICTS = frozenset({"OK", "CONTRADICTED", "UNSOURCED", "UNBACKED_CLAIM"})
 _TOOL_RESULT_MAX = 3_000
 _TOOL_RESULTS_TOTAL = 12_000
-_SYSTEM_PROMPT_MAX = 4_000
-_HISTORY_MESSAGES = 10
-_HISTORY_MESSAGE_MAX = 1_500
+_SYSTEM_PROMPT_MAX = 1_500
+_HISTORY_MESSAGES = 4
+_HISTORY_MESSAGE_MAX = 1_000
 
 _JUDGE_INSTRUCTIONS = (
     "You fact-check an AI assistant's draft ANSWER before the user sees it. Compare it with the "
@@ -249,15 +249,65 @@ _JUDGE_INSTRUCTIONS = (
     "\"issues\": [{\"claim\": \"<short quote>\", \"why\": \"<short reason>\"}]} (issues empty when OK)."
 )
 
-# Digits (counts, prices, dates, IDs), links and emails: the concrete tokens worth a judge call.
-_WORTHWHILE = re.compile(r"\d|https?://|www\.|[\w.+-]+@[\w-]+\.\w+")
+# Concrete values a reader would act on: numbers (counts, prices, dates, IDs, phones), links and
+# emails. Each is looked up in the evidence locally; only values found nowhere earn a judge call.
+_NUMBER = re.compile(r"\d(?:[\d.,:/-]*\d)?")
+_LINK_OR_EMAIL = re.compile(r"https?://[^\s<>()\"'`]+|www\.[^\s<>()\"'`]+|[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+# Small numbers (counts, list positions) are everywhere in a system prompt, so they are looked up
+# only in this turn's user message and tool results, where a made-up count has nowhere to hide.
+_SMALL_NUMBER_DIGITS = 2
+_LIST_MARKER = re.compile(r"(?m)^\s*\d{1,2}[.)]\s")
 
 
-def judge_worthwhile(answer: str, tool_results: Sequence[ToolResult]) -> bool:
-    text = (answer or "").strip()
-    if len(text) < 60 or text.endswith("?"):
-        return False
-    return bool(tool_results) or bool(_WORTHWHILE.search(text))
+def _digits(text: str) -> str:
+    return re.sub(r"\D", "", text)
+
+
+def _numbers_in(text: str) -> set:
+    return {_digits(m) for m in _NUMBER.findall(text)} | set(re.findall(r"\d+", text))
+
+
+def unsourced_values(answer: str, evidence: str, turn_evidence: Optional[str] = None) -> List[str]:
+    """Numbers, links and emails in *answer* found in no evidence. A number matches on its digits
+    ("3.500.000" is found as "3500000"); one or two-digit numbers are matched against
+    *turn_evidence* (this turn's user message and tool results) only."""
+    evidence = evidence or ""
+    evidence_lower = evidence.lower()
+    evidence_numbers = _numbers_in(evidence)
+    turn_numbers = evidence_numbers if turn_evidence is None else _numbers_in(turn_evidence)
+    found: List[str] = []
+    for match in _LINK_OR_EMAIL.findall(answer or ""):
+        value = match.rstrip(".,;:!?)]*_")
+        if value.lower() not in evidence_lower:
+            found.append(value)
+    text = _LIST_MARKER.sub(" ", _LINK_OR_EMAIL.sub(" ", answer or ""))
+    for match in _NUMBER.findall(text):
+        digits = _digits(match)
+        if len(digits) <= _SMALL_NUMBER_DIGITS:
+            if digits not in turn_numbers:
+                found.append(match)
+        elif digits not in evidence_numbers and match not in evidence:
+            found.append(match)
+    return list(dict.fromkeys(found))
+
+
+def _evidence_text(agent: Any, messages: Sequence[Any], answer: str, start_idx: int) -> Tuple[str, str]:
+    """``(all_evidence, this_turn_evidence)``: everything an answer may cite (system prompt, user
+    messages, tool results, earlier replies), and just this turn's user message and tool results."""
+    parts = [str(getattr(agent, "_cached_system_prompt", "") or "")]
+    turn_parts: List[str] = []
+    for i, msg in enumerate(messages):
+        if _skipped(msg):
+            continue
+        text = _text(msg.get("content"))
+        if msg.get("role") == "tool":
+            text = unwrap_tool_result(text)
+        if not text or text.strip() == (answer or "").strip():
+            continue
+        parts.append(text)
+        if i >= max(start_idx, 0) and msg.get("role") in ("user", "tool"):
+            turn_parts.append(text)
+    return "\n".join(parts), "\n".join(turn_parts)
 
 
 def parse_judge_reply(text: Any) -> Optional[Dict[str, Any]]:
@@ -385,8 +435,18 @@ def turn_writes(tool_results: Sequence[ToolResult]) -> Tuple[List[str], List[str
     return done, failed
 
 
+_VIETNAMESE = re.compile(r"[ăâđêôơưĂÂĐÊÔƠƯàảãáạằẳẵắặầẩẫấậèẻẽéẹềểễếệìỉĩíịòỏõóọồổỗốộờởỡớợùủũúụừửữứựỳỷỹýỵ]")
+
+
+def _reply_language(user_text: str) -> str:
+    """The language the corrected answer must use; the nudge itself is English, and a small model
+    otherwise answers it in English."""
+    return "Vietnamese" if _VIETNAMESE.search(user_text or "") else "the user's language"
+
+
 def build_claim_nudge(
     kind: str, detail: Any, *, done_writes: Sequence[str] = (), failed_writes: Sequence[str] = (),
+    user_text: str = "",
 ) -> str:
     if isinstance(detail, (list, tuple)):
         named = "; ".join(
@@ -406,8 +466,10 @@ def build_claim_nudge(
         )
     parts.append(
         "Call a write tool only for an action never attempted this turn; otherwise state honestly what "
-        "was and was not done, or that you don't know. Write the complete corrected answer in the "
-        "user's language. Reply to the user directly; do not acknowledge, thank or apologise to this check."
+        "was and was not done, or that you don't know. Keep everything in the previous answer that was "
+        f"correct. Write the complete corrected answer in {_reply_language(user_text)}, addressed to the "
+        "user. Do not open with a label such as \"Clarify:\" or \"Note:\", do not talk about tool calls, "
+        "rounds or this check, and do not acknowledge, thank or apologise to it."
     )
     return " ".join(parts)
 
@@ -426,13 +488,20 @@ def check_answer(
         if claim and not any(ok and is_write_tool(n) for n, ok, _ in tool_results):
             rule_hit = claim
     verdict = None
-    trace: Dict[str, Any] = {"rule_hit": rule_hit, "judge": "skipped" if judge else "off", "judge_error": ""}
+    # Cheap local check first: the judge (an LLM call before ``done``) runs only for a completion
+    # claim or for values that appear in no evidence. Questions to the user are never checked.
+    unsourced: List[str] = []
+    if judge and not rule_hit and not (answer or "").strip().endswith("?"):
+        unsourced = unsourced_values(answer, *_evidence_text(agent, messages, answer, start_idx))
+    trace: Dict[str, Any] = {
+        "rule_hit": rule_hit, "unsourced": unsourced, "judge": "skipped" if judge else "off", "judge_error": "",
+    }
     try:
         agent._claim_trace = trace  # read by the claim_gate observability hook
         agent._claim_judge_error = ""
     except Exception:
         pass
-    if judge and (rule_hit or judge_worthwhile(answer, tool_results)):
+    if judge and (rule_hit or unsourced):
         earlier = [m for m in list(messages)[:max(start_idx, 0)] if not _skipped(m)][-_HISTORY_MESSAGES:]
         user_text = "\n".join(
             _text(m.get("content")) for m in list(messages)[max(start_idx, 0):]
@@ -442,6 +511,8 @@ def check_answer(
         if rule_hit:
             writes = [f"{n}:{'ok' if ok else 'failed'}" for n, ok, _ in tool_results if is_write_tool(n)]
             hint = f"Completion claim \"{rule_hit}\"; write tools this turn: {', '.join(writes) or 'none'}."
+        else:
+            hint = f"Values found in no tool result, user message or earlier turn: {', '.join(unsourced)}."
         verdict = judge_grounding(
             agent, user_text=user_text, answer=answer, tool_results=tool_results,
             history=earlier, rule_hint=hint,

@@ -15,7 +15,7 @@ from agent.claim_stop import (
     find_completion_claim,
     is_write_tool,
     judge_grounding,
-    judge_worthwhile,
+    unsourced_values,
     max_claim_nudges,
     parse_judge_reply,
     turn_tool_results,
@@ -250,15 +250,18 @@ def test_judge_grounding_clips_tool_results(monkeypatch):
     assert seen["user_input"].count("x") <= claim_stop._TOOL_RESULTS_TOTAL + 50
 
 
-def test_judge_worthwhile():
-    long_plain = "Bạn có thể vào phần cài đặt để đổi mật khẩu, sau đó đăng nhập lại để áp dụng thay đổi nhé."
-    assert judge_worthwhile(long_plain, []) is False
-    assert judge_worthwhile(long_plain, [("tool", True, "x")]) is True
-    assert judge_worthwhile("Hiện có 12 ticket đang mở trong hệ thống hỗ trợ của công ty bạn hôm nay.", []) is True
-    assert judge_worthwhile("Xem tại https://example.com/docs để biết thêm chi tiết về cấu hình kênh.", []) is True
-    assert judge_worthwhile("Liên hệ support@example.com để được hỗ trợ thêm về vấn đề tài khoản nhé.", []) is True
-    assert judge_worthwhile("Có 12 ticket.", []) is False  # short
-    assert judge_worthwhile("Bạn muốn mình kiểm tra 12 ticket đang mở trong hệ thống hỗ trợ không?", []) is False
+def test_unsourced_values():
+    evidence = "hotline 1900 1234 · ticket #48213 · giá 3500000đ · https://jarvis.cx/docs · cs@jarvis.cx · 2026-10-29"
+    assert unsourced_values("Gọi 1900 1234, ticket 48213, giá 3.500.000đ.", evidence) == []
+    assert unsourced_values("Xem https://jarvis.cx/docs hoặc mail cs@jarvis.cx.", evidence) == []
+    assert unsourced_values("Năm 2026 có 12 ticket.", evidence, "user: có bao nhiêu ticket? tool: 12 open") == []
+    # A small count is checked against this turn only: "6" in the system prompt does not back it.
+    assert unsourced_values("Có 6 ticket.", evidence + " mục 6", "tool: 5 open") == ["6"]
+    assert unsourced_values("Các bước:\n1. Mở cài đặt\n2. Đổi mật khẩu", evidence, "") == []
+    assert unsourced_values("Hotline là 1800 5678.", evidence) == ["1800", "5678"]
+    assert unsourced_values("Xem https://evil.example/x hoặc sales@acme.vn.", evidence) == [
+        "https://evil.example/x", "sales@acme.vn",
+    ]
 
 
 def test_build_claim_nudge():
@@ -266,7 +269,9 @@ def test_build_claim_nudge():
     assert "Đã gửi email." in nudge
     assert "Call the appropriate tool now" not in nudge
     assert "user's language" in nudge
-    assert "do not acknowledge, thank or apologise to this check" in nudge
+    assert "Vietnamese" in build_claim_nudge("UNBACKED_CLAIM", "x", user_text="Gửi tin cho khách giúp mình")
+    assert "Clarify:" in nudge  # named as a forbidden opener
+    assert "do not acknowledge, thank or apologise to it" in nudge
     assert "never attempted" in nudge
     issues = build_claim_nudge("CONTRADICTED", [{"claim": "6 tickets", "why": "tool returned 5"}])
     assert "6 tickets" in issues and "tool returned 5" in issues

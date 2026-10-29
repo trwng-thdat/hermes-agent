@@ -781,7 +781,7 @@ DEFAULT_CONFIG = {
         "kanban_decomposer": _aux(180),
         "profile_describer": _aux(60),   # 1-2 sentence profile blurb; short, cheap
         "goal_judge": _aux(60),          # /goal satisfaction + contract drafting; JSON calls
-        "claim_gate": _aux(10),          # chat answer grounding judge; runs before `done`, keep it fast
+        "claim_gate": _aux(20),          # chat answer grounding judge; runs before `done`, only on suspect answers
         # Curator skill-usage review can take minutes on reasoning models (umbrellas over hundreds
         # of skills); route cheaper via `hermes model` → auxiliary → Curator.
         "curator": _aux(600),
