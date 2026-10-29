@@ -16,3 +16,4 @@ provides_hooks:
   - on_session_end
   - subagent_start
   - subagent_stop
+  - claim_gate
