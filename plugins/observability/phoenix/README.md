@@ -90,11 +90,34 @@ Phoenix projects, prefer `metadata`.
 
 ## Span shape
 
-- **agent turn** — root span, `openinference.span.kind = CHAIN`, `session.id` set
-  for Phoenix session grouping; input = last user message, output = final answer.
-- **LLM call N** — `kind = LLM`, with `llm.model_name`, `llm.provider`,
-  `llm.token_count.prompt/completion/total`, input messages, output message.
-- **Tool: `<name>`** — `kind = TOOL`, with `tool.name`, input args, output result.
+A turn reads top to bottom as what the agent decided at each step:
+
+```
+Có bao nhiêu kênh Zalo đang kết nối?      4 bước · 3 tool (2 lỗi) · 23.0s · 54199 tok
+  1. → tool_describe
+     tool_describe
+  2. → helpdesk.get_app_channel_by_type
+     helpdesk.get_app_channel_by_type      ERROR
+  3. Trả lời
+  Claim gate: OK
+    Judge
+```
+
+- **Turn** (root) — named after the user's message, `kind = CHAIN`, `session.id` set for
+  Phoenix session grouping. Input = the user message, output = the final answer as text;
+  `hermes.summary` = steps · tools (errors) · duration · tokens; metadata carries the profile.
+  The turn ends on the turn-level `post_llm_call`, so gate retries stay in one trace.
+- **`N. <decision>`** — one `kind = LLM` span per model call, renamed when it returns to
+  `→ <tools it called>` or `Trả lời`. Input = only the messages added since the previous step
+  (step 1 also carries the system prompt), as `llm.input_messages` plus a readable digest.
+  Output = reasoning, the tool calls with their arguments, or the answer; token counts.
+- **`<server>.<tool>`** — `kind = TOOL`, nested under the step that called it. A `tool_call`
+  dispatcher is unwrapped to its real target and arguments; nested JSON strings in results
+  are parsed. A failed result is marked ERROR with its message as the output.
+- **`Claim gate: <verdict>`** — `kind = GUARDRAIL`, from the `claim_gate` hook: the answer
+  checked, the verdict, the nudge sent back (if any), how the judge went.
+  - **`Judge`** — `kind = LLM` child with the judge's prompt and JSON verdict, timed to the
+    real call; `Judge (timeout)` / `Judge (error)` are marked ERROR.
 - **Subagent: `<role>`** — `kind = AGENT`, delegated child runs under the turn.
 
 Failed model requests close their LLM span with an ERROR status; non-retryable
