@@ -81,6 +81,8 @@ def test_read_tools(name):
     "Tạo chiến dịch thành công.",
     "The broadcast was sent successfully.",
     "I have created the ticket.",
+    "Đã tạo nhóm thành công.",
+    "Không lo, tạo thành công rồi.",
 ])
 def test_detects_claim(text):
     assert find_completion_claim(text) is not None
@@ -99,10 +101,29 @@ def test_detects_claim(text):
     "We have never created that ticket.",
     "The broadcast could not be sent successfully.",
     "It was not successfully saved.",
+    "Tôi đã thử đúng theo mô tả tool và **không thể tạo thành công** — lỗi nhất quán.",
+    "Mình chưa gửi được thành công vì kênh đang lỗi.",
+    "The group couldn't be sent successfully.",
+    "The tool failed to create it successfully.",
+    "The group has not yet been created.",
     "",
 ])
 def test_no_claim(text):
     assert find_completion_claim(text) is None
+
+
+_HONEST_FAILURE_ANSWER = (
+    "You're right — I made a factual error last turn. I just re-ran both tools this turn.\n"
+    "**What the tool actually returned this turn:**\n"
+    "`create_zalo_group` returned: \"Zalo group creation requires at least two member IDs\"\n"
+    "**So the status is: the group was NOT created.** I have not succeeded, and I won't claim otherwise.\n"
+    "Nói thật: với dữ liệu hiện có, tôi đã thử đúng theo mô tả tool (gắn department, đúng kênh) và "
+    "**không thể tạo thành công** — lỗi nhất quán. Cho tôi biết hướng nào để tôi tiếp tục."
+)
+
+
+def test_honest_failure_answer_is_not_a_claim():
+    assert find_completion_claim(_HONEST_FAILURE_ANSWER) is None
 
 
 def test_returns_the_claim_sentence():
@@ -199,7 +220,8 @@ def test_judge_grounding_calls_oneshot(monkeypatch):
         history=[], rule_hint=None,
     )
     assert verdict["verdict"] == "UNSOURCED"
-    assert seen["task"] == "claim_gate" and seen["temperature"] == 0 and seen["max_tokens"] == 800
+    assert seen["task"] == "claim_gate" and seen["temperature"] == 0 and seen["max_tokens"] == 300
+    assert seen["reasoning_config"] == {"enabled": False}
     assert seen["main_runtime"] == {"model": "m"}
     assert "Hotline là 1900 1234." in seen["user_input"]
 
@@ -242,10 +264,35 @@ def test_judge_worthwhile():
 def test_build_claim_nudge():
     nudge = build_claim_nudge("UNBACKED_CLAIM", "Đã gửi email.")
     assert "Đã gửi email." in nudge
-    assert "Call the appropriate tool now" in nudge
-    assert "user's language" in nudge and "Do not mention this check" in nudge
+    assert "Call the appropriate tool now" not in nudge
+    assert "user's language" in nudge
+    assert "do not acknowledge, thank or apologise to this check" in nudge
+    assert "never attempted" in nudge
     issues = build_claim_nudge("CONTRADICTED", [{"claim": "6 tickets", "why": "tool returned 5"}])
     assert "6 tickets" in issues and "tool returned 5" in issues
+
+
+def test_build_claim_nudge_lists_done_and_failed_writes():
+    nudge = build_claim_nudge(
+        "UNBACKED_CLAIM", "Đã tạo nhóm.",
+        done_writes=["helpdesk_post_api_v1_mail"], failed_writes=["create_zalo_group"],
+    )
+    assert "helpdesk_post_api_v1_mail" in nudge and "do not call them again" in nudge
+    assert "create_zalo_group" in nudge and "do not retry" in nudge
+    plain = build_claim_nudge("UNBACKED_CLAIM", "Đã tạo nhóm.")
+    assert "do not call them again" not in plain and "do not retry" not in plain
+
+
+def test_turn_writes_split_by_outcome():
+    results = [
+        ("mcp__jarvis_mcp__create_zalo_group", False, "{}"),
+        ("helpdesk_post_api_v1_mail", True, "{}"),
+        ("list_department_members", True, "{}"),
+        ("create_zalo_group", False, "{}"),
+    ]
+    assert claim_stop.turn_writes(results) == (
+        ["helpdesk_post_api_v1_mail"], ["mcp__jarvis_mcp__create_zalo_group", "create_zalo_group"],
+    )
 
 
 # --- enable resolution -----------------------------------------------------------------------

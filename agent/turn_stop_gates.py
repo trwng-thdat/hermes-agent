@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -100,7 +101,8 @@ def _claim_stop_nudge(
     fallback never meets a retracted answer."""
     try:
         from agent.claim_stop import (
-            build_claim_nudge, check_answer, claim_gate_enabled, claim_judge_enabled, max_claim_nudges
+            build_claim_nudge, check_answer, claim_gate_enabled, claim_judge_enabled, max_claim_nudges,
+            turn_tool_results, turn_writes,
         )
 
         if not final_response or not claim_gate_enabled(agent):
@@ -116,17 +118,43 @@ def _claim_stop_nudge(
         if current_turn_user_idx is None:
             from agent.turn_context import reanchor_current_turn_user_idx
             current_turn_user_idx = reanchor_current_turn_user_idx(messages, None)
+        started = time.monotonic()
         hit = check_answer(
             agent, messages, final_response, current_turn_user_idx, judge=claim_judge_enabled()
         )
-        if hit is None:
-            return None
-        kind, detail = hit
-        logger.info("claim gate nudge issued (attempt %d) kind=%s detail=%s", attempts + 1, kind, detail)
-        return build_claim_nudge(kind, detail)
+        nudge = None
+        if hit is not None:
+            kind, detail = hit
+            logger.info("claim gate nudge issued (attempt %d) kind=%s detail=%s", attempts + 1, kind, detail)
+            done, failed = turn_writes(turn_tool_results(messages, current_turn_user_idx))
+            nudge = build_claim_nudge(kind, detail, done_writes=done, failed_writes=failed)
+        _emit_claim_gate_hook(agent, final_response, hit, nudge, attempts + 1, started)
+        return nudge
     except Exception:
         logger.info("claim gate check failed open", exc_info=True)
         return None
+
+
+def _emit_claim_gate_hook(agent, answer, hit, nudge, attempt, started) -> None:
+    """Observability (Phoenix GUARDRAIL span): what the gate checked and decided. Fail-open."""
+    trace = getattr(agent, "_claim_trace", None) or {}
+    try:
+        from hermes_cli.plugins import invoke_hook
+
+        invoke_hook(
+            "claim_gate",
+            task_id=getattr(agent, "_current_task_id", "") or "",
+            session_id=getattr(agent, "session_id", "") or "",
+            turn_id=getattr(agent, "_current_turn_id", "") or "",
+            answer=answer, verdict=hit[0] if hit else "OK", detail=hit[1] if hit else None,
+            rule_hit=trace.get("rule_hit"), judge=trace.get("judge", ""),
+            judge_error=trace.get("judge_error", ""), judge_input=trace.get("judge_input"),
+            judge_reply=trace.get("judge_reply"), judge_started=trace.get("judge_started"),
+            judge_ended=trace.get("judge_ended"),
+            duration_ms=round((time.monotonic() - started) * 1000, 1), nudge=nudge, attempt=attempt,
+        )
+    except Exception:
+        logger.debug("claim_gate hook failed", exc_info=True)
 
 
 def _append_interim_answer(agent, final_msg, messages, conversation_history, flush_fail_msg: str) -> None:

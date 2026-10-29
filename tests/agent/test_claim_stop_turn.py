@@ -90,7 +90,7 @@ def test_unbacked_claim_is_retracted_and_corrected(agent, db):
     # The retry saw the rejected answer and the nudge.
     retry = sent[1]
     assert retry[-2]["role"] == "assistant" and CLAIM in str(retry[-2]["content"])
-    assert retry[-1]["role"] == "user" and "Call the appropriate tool now" in retry[-1]["content"]
+    assert retry[-1]["role"] == "user" and "do not acknowledge, thank or apologise" in retry[-1]["content"]
     assert ("answer_retracted", "answer retracted") in statuses
     assert emitted == []  # never surfaced as an interim message
     assert agent._claim_stop_nudges == 1
@@ -207,3 +207,28 @@ def test_interrupt_during_judge_skips_nudge(agent, monkeypatch):
         _result, sent, statuses, _ = _run(agent, [LONG_FACT], text="có bao nhiêu ticket mở?")
     assert len(sent) == 1
     assert not any(kind == "answer_retracted" for kind, _ in statuses)
+
+
+def test_nudge_names_failed_writes(monkeypatch):
+    from agent.turn_stop_gates import _claim_stop_nudge
+
+    monkeypatch.setenv("HERMES_CLAIM_GATE", "1")
+    monkeypatch.setenv("HERMES_CLAIM_JUDGE", "0")
+
+    def call(cid, name):
+        return {"id": cid, "type": "function", "function": {"name": name, "arguments": "{}"}}
+
+    messages = [
+        {"role": "user", "content": "tạo nhóm zalo"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            call("c1", "mcp__aeo__create_zalo_group"), call("c2", "list_department_members"),
+        ]},
+        {"role": "tool", "tool_call_id": "c1", "content": '{"error": "requires at least two member IDs"}'},
+        {"role": "tool", "tool_call_id": "c2", "content": '{"result": "3 members"}'},
+    ]
+    agent = SimpleNamespace(max_iterations=6, iteration_budget=None, _claim_stop_nudges=0)
+    nudge = _claim_stop_nudge(agent, messages, "Đã tạo nhóm Zalo cho bạn.", 0, 1)
+
+    assert nudge is not None
+    assert "do not retry" in nudge and "mcp__aeo__create_zalo_group" in nudge
+    assert "do not call them again" not in nudge and "list_department_members" not in nudge

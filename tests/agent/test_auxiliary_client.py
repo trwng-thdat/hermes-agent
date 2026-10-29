@@ -2093,6 +2093,38 @@ class TestTransientTransportRetry:
         assert primary.chat.completions.create.call_count == 1
         assert fb_client.chat.completions.create.call_count == 1
 
+    def test_claim_gate_timeout_neither_retries_nor_falls_back(self):
+        """The claim gate runs before ``done`` and fails open: a timeout ends the call after one
+        ``timeout`` window instead of retrying or walking the fallback chain."""
+        class _Timeout(Exception):
+            pass
+        _Timeout.__name__ = "APITimeoutError"
+
+        primary = MagicMock()
+        primary.base_url = "https://openrouter.ai/api/v1"
+        primary.chat.completions.create.side_effect = _Timeout("Request timed out.")
+
+        fb_client = MagicMock()
+        fb_client.base_url = "https://api.openai.com/v1"
+        fb_client.chat.completions.create.return_value = {"fallback": True}
+
+        p1, p2, p3 = self._patches(primary)
+        with (
+            p1, p2, p3,
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(fb_client, "fb-model", "openai"),
+            ),
+            patch(
+                "agent.auxiliary_client._try_main_agent_model_fallback",
+                return_value=(fb_client, "fb-model", "openai"),
+            ),
+            pytest.raises(_Timeout),
+        ):
+            call_llm(task="claim_gate", messages=[{"role": "user", "content": "hi"}])
+        assert primary.chat.completions.create.call_count == 1
+        assert fb_client.chat.completions.create.call_count == 0
+
     def test_vision_skips_same_provider_retry_on_timeout(self):
         """Vision is on the interactive critical path: the turn holding the
         image cannot answer, and because turns are serialised the following

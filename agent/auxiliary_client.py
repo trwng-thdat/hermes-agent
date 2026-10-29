@@ -3465,7 +3465,10 @@ def _is_invalid_aux_response_error(exc: Exception) -> bool:
 # compression case. Title generation joins them because its retries multiplied the user's
 # ``auxiliary.title_generation.timeout`` (~4x: three full windows plus backoff) on a slow local
 # model, and the auto-title thread outlived the deadline the user thought they had set (#89445, #66251).
-_TIMEOUT_NO_RETRY_TASKS = frozenset({"compression", "vision", "title_generation"})
+_TIMEOUT_NO_RETRY_TASKS = frozenset({"compression", "vision", "title_generation", "claim_gate"})
+# Tasks that fail open: a timeout ends the call instead of walking the fallback chain, so the
+# check never stretches the turn past its own ``timeout`` (the claim gate runs before ``done``).
+_TIMEOUT_NO_FALLBACK_TASKS = frozenset({"claim_gate"})
 
 
 def _should_skip_same_provider_retry(task: Optional[str], exc: Exception) -> bool:
@@ -7625,6 +7628,9 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
         reason == "auth error" and not is_auto and has_task_fallback_chain
     )
     if reason is None or not (is_auto or is_capacity_error or explicit_auth_with_task_chain):
+        return None
+    if reason == "request timed out" and task in _TIMEOUT_NO_FALLBACK_TASKS:
+        logger.info("Auxiliary %s%s: timed out after %ss; not falling back", task, tag, route.timeout)
         return None
     if reason == "payment error":
         # Mark the concrete backend (not the "auto" label) unhealthy so later aux calls skip

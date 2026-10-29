@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import time
 import unicodedata
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -109,16 +110,20 @@ _WRITE_VERB = re.compile(r"(?:^|_)(?:create|update|delete|remove|send|schedule|c
 _MCP_PREFIX = re.compile(r"^mcp__(?P<server>.+?)__(?P<tool>.+)$")
 
 _LETTER = r"[^\W\d_]"
-# Negated outcomes ("chưa thành công", "not sent") are honest admissions, not claims.
-_VI_NEGATION_TAIL = re.compile(rf"(?<!{_LETTER})(?:chưa|không|chẳng)(?:\s+(?:thể|được|có|hề))*\s+$", re.I)
-_EN_NEGATION_TAIL = re.compile(r"\b(?:not|never)\s+(?:\w+\s+){0,2}$", re.I)
+# Negated outcomes ("không thể tạo thành công", "couldn't be sent") are honest admissions, not
+# claims. Up to three words may sit between the negation and the claim; a clause break ends it.
+_NEGATION_GAP = r"(?:[^\s,;:.!?]+\s+){0,3}"
+_VI_NEGATION_TAIL = re.compile(rf"(?<!{_LETTER})(?:chưa|không|chẳng)\s+{_NEGATION_GAP}$", re.I)
+_EN_NEGATION_TAIL = re.compile(
+    rf"(?:\b(?:not|never|cannot|unable\s+to|failed\s+to)|\w+n't)\s+{_NEGATION_GAP}$", re.I
+)
 _CLAIM_PATTERNS: Tuple[Tuple[re.Pattern, Optional[re.Pattern]], ...] = (
     (re.compile(rf"(?<!{_LETTER})đã\s+(?:gửi|tạo|cập nhật|xoá|xóa|lên lịch|đăng|thêm|lưu|hủy|huỷ)(?!{_LETTER})", re.I), None),
     (re.compile(rf"(?<!{_LETTER})hoàn tất(?!{_LETTER})", re.I), _VI_NEGATION_TAIL),
     (re.compile(rf"(?<!{_LETTER})thành công(?!{_LETTER})", re.I), _VI_NEGATION_TAIL),
     (re.compile(
         r"\b(?:have|has|was|were|been|i've|we've)\s+(?:(?!not\b|never\b)\w+\s+)?"
-        r"(?:sent|created|updated|deleted|scheduled|saved|posted)\b", re.I), None),
+        r"(?:sent|created|updated|deleted|scheduled|saved|posted)\b", re.I), _EN_NEGATION_TAIL),
     (re.compile(r"\bsuccessfully\b", re.I), _EN_NEGATION_TAIL),
 )
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?…\n])\s*")
@@ -330,17 +335,38 @@ def judge_grounding(
         if rule_hint:
             sections.append(f"RULE CHECK HINT:\n{rule_hint}")
         sections.append(f"ANSWER:\n{answer}")
+        user_input = "\n\n".join(sections)
+        _note_judge_call(agent, judge_input=user_input, judge_started=time.time())
         reply = run_oneshot(
-            instructions=_JUDGE_INSTRUCTIONS, user_input="\n\n".join(sections), task="claim_gate",
-            max_tokens=800, temperature=0, timeout=timeout, main_runtime=agent._current_main_runtime(),
+            instructions=_JUDGE_INSTRUCTIONS, user_input=user_input, task="claim_gate",
+            max_tokens=300, temperature=0, timeout=timeout, main_runtime=agent._current_main_runtime(),
+            reasoning_config={"enabled": False},  # a short JSON verdict needs no thinking
         )
+        _note_judge_call(agent, judge_reply=reply, judge_ended=time.time())
     except Exception as exc:
+        _note_judge_call(agent, judge_ended=time.time())
         logger.info("claim gate judge failed open: %s", exc)
+        _note_judge_error(agent, str(exc))
         return None
     parsed = parse_judge_reply(reply)
     if parsed is None:
         logger.info("claim gate judge failed open: unparseable reply %r", (reply or "")[:200])
+        _note_judge_error(agent, "unparseable reply")
     return parsed
+
+
+def _note_judge_call(agent: Any, **fields: Any) -> None:
+    """Record the judge's prompt, reply and timing on ``agent._claim_trace`` (observability)."""
+    trace = getattr(agent, "_claim_trace", None)
+    if isinstance(trace, dict):
+        trace.update(fields)
+
+
+def _note_judge_error(agent: Any, error: str) -> None:
+    try:
+        agent._claim_judge_error = error
+    except Exception:
+        pass
 
 
 # --- nudge ---------------------------------------------------------------------------------
@@ -352,7 +378,16 @@ _NUDGE_LEAD = {
 }
 
 
-def build_claim_nudge(kind: str, detail: Any) -> str:
+def turn_writes(tool_results: Sequence[ToolResult]) -> Tuple[List[str], List[str]]:
+    """``(succeeded, failed)`` write tool names from this turn's results, in call order."""
+    done = [n for n, ok, _ in tool_results if ok and is_write_tool(n)]
+    failed = [n for n, ok, _ in tool_results if not ok and is_write_tool(n)]
+    return done, failed
+
+
+def build_claim_nudge(
+    kind: str, detail: Any, *, done_writes: Sequence[str] = (), failed_writes: Sequence[str] = (),
+) -> str:
     if isinstance(detail, (list, tuple)):
         named = "; ".join(
             f"\"{i.get('claim', '')}\" ({i.get('why', '')})" if i.get("why") else f"\"{i.get('claim', '')}\""
@@ -361,11 +396,20 @@ def build_claim_nudge(kind: str, detail: Any) -> str:
     else:
         named = f"\"{detail}\"" if detail else ""
     lead = _NUDGE_LEAD.get(kind, _NUDGE_LEAD["UNSOURCED"])
-    return (
-        f"[System check] {lead}{': ' + named if named else ''}. "
-        "Call the appropriate tool now, or answer honestly that it was not done / you don't know. "
-        "Write the complete corrected answer in the user's language. Do not mention this check."
+    parts = [f"[System check] {lead}{': ' + named if named else ''}."]
+    if done_writes:
+        parts.append(f"Already done this turn, do not call them again: {', '.join(dict.fromkeys(done_writes))}.")
+    if failed_writes:
+        parts.append(
+            f"Failed this turn, do not retry unless the user asks; tell the user it failed and why: "
+            f"{', '.join(dict.fromkeys(failed_writes))}."
+        )
+    parts.append(
+        "Call a write tool only for an action never attempted this turn; otherwise state honestly what "
+        "was and was not done, or that you don't know. Write the complete corrected answer in the "
+        "user's language. Reply to the user directly; do not acknowledge, thank or apologise to this check."
     )
+    return " ".join(parts)
 
 
 # --- decision ------------------------------------------------------------------------------
@@ -382,6 +426,12 @@ def check_answer(
         if claim and not any(ok and is_write_tool(n) for n, ok, _ in tool_results):
             rule_hit = claim
     verdict = None
+    trace: Dict[str, Any] = {"rule_hit": rule_hit, "judge": "skipped" if judge else "off", "judge_error": ""}
+    try:
+        agent._claim_trace = trace  # read by the claim_gate observability hook
+        agent._claim_judge_error = ""
+    except Exception:
+        pass
     if judge and (rule_hit or judge_worthwhile(answer, tool_results)):
         earlier = [m for m in list(messages)[:max(start_idx, 0)] if not _skipped(m)][-_HISTORY_MESSAGES:]
         user_text = "\n".join(
@@ -396,6 +446,9 @@ def check_answer(
             agent, user_text=user_text, answer=answer, tool_results=tool_results,
             history=earlier, rule_hint=hint,
         )
+        error = str(getattr(agent, "_claim_judge_error", "") or "")
+        trace["judge"] = "ok" if verdict is not None else ("timeout" if "timed out" in error.lower() else "error")
+        trace["judge_error"] = error
         if getattr(agent, "_interrupt_requested", False):
             return None
     if verdict is not None:
