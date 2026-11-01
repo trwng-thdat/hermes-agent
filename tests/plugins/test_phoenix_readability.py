@@ -102,7 +102,41 @@ def test_turn_tree(spans):
     assert step2.parent.span_id == root.context.span_id
     assert "tool helpdesk.get_x" in step2.attributes["input.value"]  # only what is new since step 1
     assert "sys" not in step2.attributes["input.value"]
-    assert judge.parent.span_id == gate.context.span_id
-    assert json.loads(judge.attributes["output.value"]) == {"verdict": "OK", "issues": []}
+    assert gate.parent.span_id == root.context.span_id
+    assert gate.attributes["output.value"] == "OK — answer accepted"
     assert root.attributes["output.value"] == "Chưa tra được."
     assert root.attributes["hermes.summary"].startswith("2 bước · 1 tool (1 lỗi)")
+
+
+def test_subagent_turn_nests_inside_the_parent_trace(spans):
+    ids = dict(task_id="t", session_id="s", turn_id="u", platform="tool")
+    turn = {k: ids[k] for k in ("task_id", "session_id", "turn_id")}
+    history = [{"role": "user", "content": "Lấy khách theo tag"}]
+    call = {"id": "d1", "function": {"name": "delegate_task", "arguments": "{}"}}
+    phoenix._SUBAGENT_PARENTS.clear()
+
+    phoenix.on_pre_llm_request(api_call_count=1, request_messages=history, **ids)
+    phoenix.on_post_llm_call(api_call_count=1, assistant_message=_msg("", [call]), **ids)
+    phoenix.on_pre_tool_call(tool_name="delegate_task", args={}, tool_call_id="d1", **ids)
+    phoenix.on_subagent_start(parent_turn_id="u", child_session_id="child", child_role="leaf",
+                              child_goal="Tra khách cho tag VIP")
+    # The child runs its own turn under its own session id and platform.
+    child = dict(task_id="sa-0", session_id="child", turn_id="child:sa-0", platform="subagent")
+    phoenix.on_pre_llm_request(api_call_count=1, request_messages=[{"role": "user", "content": "Tra khách cho tag VIP"}],
+                               **child)
+    phoenix.on_post_llm_call(api_call_count=1, assistant_message=_msg("Không có khách."), **child)
+    phoenix.on_post_llm_call(assistant_response="Không có khách.",
+                             **{k: child[k] for k in ("task_id", "session_id", "turn_id")})
+    phoenix.on_subagent_stop(parent_turn_id="u", child_session_id="child", child_role="leaf",
+                             child_summary="Không có khách.", child_status="completed")
+    phoenix.on_post_tool_call(tool_name="delegate_task", result={"results": []}, tool_call_id="d1", **ids)
+    phoenix.on_post_llm_call(assistant_response="Xong.", **turn)
+
+    by_name = {s.name: s for s in spans.get_finished_spans()}
+    root, delegate = by_name["Lấy khách theo tag"], by_name["delegate_task"]
+    agent, child_root = by_name["Subagent: Tra khách cho tag VIP"], by_name["Tra khách cho tag VIP"]
+    assert agent.parent.span_id == delegate.context.span_id  # subagents nest under the delegate call
+    assert child_root.parent.span_id == agent.context.span_id  # the child's turn nests under its subagent
+    assert child_root.context.trace_id == root.context.trace_id  # one trace, not five separate ones
+    assert by_name["1. Trả lời"].parent.span_id == child_root.context.span_id
+    assert not phoenix._SUBAGENT_PARENTS

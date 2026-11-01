@@ -117,7 +117,8 @@ Có bao nhiêu kênh Zalo đang kết nối?      4 bước · 3 tool (2 lỗi) 
 - **`Claim gate: <verdict> → <action>`** — `kind = GUARDRAIL`, from the `claim_gate` hook: the
   answer checked, the verdict, the execution receipts it read, and the nudge sent back or the
   receipts summary that replaced the answer.
-- **Subagent: `<role>`** — `kind = AGENT`, delegated child runs under the turn.
+- **Subagent: `<goal>`** — `kind = AGENT`, nested under the `delegate_task` call that spawned
+  it. The child's own turn (its steps and tools) nests inside, in the same trace and project.
 
 Failed model requests close their LLM span with an ERROR status; non-retryable
 failures also finish the turn span. Session end/finalize closes any still-open
