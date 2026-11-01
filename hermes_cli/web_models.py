@@ -343,6 +343,10 @@ class MCPEnabledToggle(BaseModel):
     enabled: bool
     profile: Optional[str] = None
 
+class MCPServerReload(BaseModel):
+    # Profiles to bring server ``name`` up to date in, processed in this order.
+    profiles: List[str]
+
 class MCPCatalogInstall(BaseModel):
     name: str
     env: Dict[str, str] = {}  # KEY=VALUE for entries declaring required env vars

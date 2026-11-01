@@ -20,10 +20,12 @@ from fastapi.responses import HTMLResponse
 
 from hermes_cli.web_deps import late
 from hermes_cli.web_server_mcp import _mcp_oauth_flows, _mcp_server_summary, _normalize_mcp_server_create
-from hermes_cli.web_models import MCPCatalogInstall, MCPEnabledToggle, MCPServerCreate, MCPServersReplace
+from hermes_cli.web_models import (
+    MCPCatalogInstall, MCPEnabledToggle, MCPServerCreate, MCPServerReload, MCPServersReplace,
+)
 from hermes_cli.web_routers._common import (
-    _profile_cli_args, _profile_scope, _spawn_hermes_action, config_write_scope, http_failure,
-    log as _log, scoped_to_thread,
+    _profile_cli_args, _profile_scope, _spawn_hermes_action, config_scoped_to_thread, config_write_scope,
+    http_failure, log as _log, scoped_to_thread,
 )
 
 router = APIRouter()
@@ -162,6 +164,27 @@ async def remove_mcp_server(name: str, profile: Optional[str] = None):
     if not await asyncio.to_thread(_run):
         raise HTTPException(status_code=404, detail=f"Server '{name}' not found")
     return {"ok": True}
+
+
+@router.post("/api/mcp/servers/{name}/reload")
+async def reload_mcp_server(name: str, body: MCPServerReload, request: Request):
+    """Bring server ``name`` up to date in each listed profile from its config on disk, without a
+    restart: only ``name``, only that profile's side of a shared connection. Profiles run one after
+    another in the given order. A profile that fails (connect error, unknown profile) is reported
+    in its row, never as a 5xx."""
+    from hermes_cli.mcp_reload_live import reload_mcp_server as _reload
+
+    _require_token(request)
+    results: Dict[str, Any] = {}
+    for profile in body.profiles:
+        try:
+            results[profile] = await config_scoped_to_thread(profile, lambda: _reload(name))
+        except Exception as exc:
+            detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+            _log.warning("MCP reload of %r in profile %r failed: %s", name, profile, detail)
+            results[profile] = {"name": name, "connected": False, "tools": [], "removed": False,
+                                "reconnected": False, "error": str(detail)}
+    return {"ok": True, "results": results}
 
 
 # ---------------------------------------------------------------------------
