@@ -99,6 +99,12 @@ class TestBatchPlaceholderGoals(unittest.TestCase):
         self.assertIn("error", result)
         self.assertIn("template", result["error"].lower())
 
+    def test_runtime_value_marker_says_how_to_rewrite_it(self):
+        """A cursor the subagent reads while running has no real value to substitute; the error
+        must say how to word it instead of only asking for the value."""
+        result = _call([{"goal": "Page search_customers with offset=<next_offset> until it is null"}])
+        self.assertIn("'the next_offset returned by the previous call'", result["error"])
+
     def test_code_shaped_brackets_not_rejected(self):
         """Generics, HTML tags, JSON snippets, glob braces, and f-string-style
         single-word placeholders are legitimate goal content — the narrow
