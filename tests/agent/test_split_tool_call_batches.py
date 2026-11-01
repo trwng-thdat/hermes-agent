@@ -31,6 +31,14 @@ def test_local_batch_becomes_one_call_per_entry_with_distinct_ids():
     assert _calls(original) == [TAGS, SEARCH]  # the emitted call is copied, never mutated
 
 
+def test_a_dozen_local_entries_are_split():
+    """Trace 253cbea5: a 12-tag count went over the old cap of 8 and cost a round on the rejection."""
+    entries = [{"name": "mcp__helpdesk__get_customer", "arguments": {"tagIDs": f"tag_{n}"}} for n in range(12)]
+    out = split_local_tool_call_batches([_tc({"calls": entries})])
+    assert [_calls(tc) for tc in out] == [[e] for e in entries]
+    assert len({tc.id for tc in out}) == 12
+
+
 def test_connector_entries_stay_batched_in_place():
     out = split_local_tool_call_batches([_tc({"calls": [TAGS, MAIL, DRAFT, SEARCH]})])
     assert [_calls(tc) for tc in out] == [[TAGS], [MAIL, DRAFT], [SEARCH]]
@@ -55,7 +63,7 @@ def test_calls_that_need_no_split_return_the_same_list():
         _tc({"calls": [TAGS]}),
         _tc({"calls": [MAIL, DRAFT]}, "call_2"),
         _tc("not json {", "call_3"),
-        _tc({"calls": [TAGS] * 9}, "call_4"),  # over the cap: the rejection still answers
+        _tc({"calls": [TAGS] * 65}, "call_4"),  # over the cap: the rejection still answers
         _tc({"calls": [TAGS, SEARCH]}, "call_5|fc_5"),  # Responses composite id
     ]
     assert split_local_tool_call_batches(calls) is calls
