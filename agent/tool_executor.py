@@ -709,6 +709,17 @@ def _dispatch_authorized_once(
             block_message=block_message, block_error_type=block_error_type, guardrail_decision=guardrail_decision,
         )
 
+    # Execution ledger: a write that already succeeded this turn, or whose outcome is still
+    # unknown, is not sent again (duplicate side effects).
+    from agent import execution_ledger
+    duplicate = execution_ledger.before_execute(agent, ref.name, ref.args, ref.call_id)
+    if duplicate is not None:
+        _advance_start_order()
+        state.blocked = True
+        ref.emit_post(agent, duplicate, status="blocked", error_type="duplicate_write",
+                      error_message="same write already executed this turn")
+        return duplicate
+
     if ref.name == "memory":
         agent._turns_since_memory = 0
     elif ref.name == "skill_manage":
@@ -717,7 +728,8 @@ def _dispatch_authorized_once(
     from agent.terminal_approval_batch import prepare_current_terminal
     prepare_current_terminal(ref)
     _advance_start_order(lambda: _begin_tool_execution(agent, ref, display_index))
-    return _run_with_activity_heartbeat(agent, ref.name, lambda: execute(ref.args))
+    result = _run_with_activity_heartbeat(agent, ref.name, lambda: execute(ref.args))
+    return execution_ledger.after_execute(agent, ref.name, ref.args, ref.call_id, result)
 
 
 def _run_agent_tool_execution_middleware(

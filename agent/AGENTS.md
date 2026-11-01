@@ -47,6 +47,11 @@ Each phase of an iteration is its own sibling, so a change to (say) overflow han
 Messages use OpenAI format `{"role": "system|user|assistant|tool", ...}`; reasoning content is stored
 in `assistant_msg["reasoning"]`.
 
+**Write receipts**: `_dispatch_authorized_once` in `agent/tool_executor.py` runs every write through
+`agent/execution_ledger.py` (dedup before, SUCCEEDED/FAILED/UNKNOWN receipt after); the chat claim
+gate in `turn_stop_gates` checks answers against it. See
+`website/docs/user-guide/features/execution-ledger.md`.
+
 **Agent-level tools** (`todo`, `memory`, ...) are intercepted by `agent/tool_executor.py` through the
 `INLINE_TOOL_EXECUTORS` table in `agent/inline_tool_executors.py` before `handle_function_call()`.
 Adding one: register in that table (no `if name == ...` chain); `tools/todo_tool.py` is the pattern.

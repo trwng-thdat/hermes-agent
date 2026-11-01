@@ -114,10 +114,9 @@ Có bao nhiêu kênh Zalo đang kết nối?      4 bước · 3 tool (2 lỗi) 
 - **`<server>.<tool>`** — `kind = TOOL`, nested under the step that called it. A `tool_call`
   dispatcher is unwrapped to its real target and arguments; nested JSON strings in results
   are parsed. A failed result is marked ERROR with its message as the output.
-- **`Claim gate: <verdict>`** — `kind = GUARDRAIL`, from the `claim_gate` hook: the answer
-  checked, the verdict, the nudge sent back (if any), how the judge went.
-  - **`Judge`** — `kind = LLM` child with the judge's prompt and JSON verdict, timed to the
-    real call; `Judge (timeout)` / `Judge (error)` are marked ERROR.
+- **`Claim gate: <verdict> → <action>`** — `kind = GUARDRAIL`, from the `claim_gate` hook: the
+  answer checked, the verdict, the execution receipts it read, and the nudge sent back or the
+  receipts summary that replaced the answer.
 - **Subagent: `<role>`** — `kind = AGENT`, delegated child runs under the turn.
 
 Failed model requests close their LLM span with an ERROR status; non-retryable

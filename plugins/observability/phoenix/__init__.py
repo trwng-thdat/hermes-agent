@@ -1038,71 +1038,32 @@ def on_pre_turn_gate(*, gate: str = "", session_id: str = "", platform: str = ""
 
 
 def on_claim_gate(*, task_id: str = "", session_id: str = "", turn_id: str = "", answer: Any = "",
-                  verdict: str = "", detail: Any = None, rule_hit: Any = None, judge: str = "",
-                  judge_error: str = "", duration_ms: Any = None, nudge: Any = None, attempt: Any = None,
-                  judge_input: Any = None, judge_reply: Any = None, judge_started: Any = None,
-                  judge_ended: Any = None, **_: Any) -> None:
+                  verdict: str = "", detail: Any = None, action: Any = None, nudge: Any = None,
+                  replacement: Any = None, receipts: Any = None, duration_ms: Any = None,
+                  attempt: Any = None, **_: Any) -> None:
     """The chat claim gate (agent.claim_stop) checked a final answer before the turn ends: one
-    GUARDRAIL span with the verdict, how the judge went, and the nudge sent back if any."""
+    GUARDRAIL span with the verdict, the execution receipts it read, and the nudge or the
+    replacement answer it produced."""
     with _STATE_LOCK:
         state = _TRACE_STATE.get(_trace_key(task_id, session_id, turn_id=turn_id)) or _state_for_turn(turn_id)
     if state is None:
         return
     ms = duration_ms if isinstance(duration_ms, (int, float)) and duration_ms > 0 else 0
-    outcome = f"{verdict} → nudge" if nudge else "OK"
-    judge_note = f" · judge {judge}" if judge and judge != "ok" else ""
-    span = _start_child(state, name=f"Claim gate: {outcome}{judge_note}", kind=_KIND_GUARDRAIL,
+    outcome = f"{verdict} → {action}" if action else "OK"
+    span = _start_child(state, name=f"Claim gate: {outcome}", kind=_KIND_GUARDRAIL,
                         start_time=time.time_ns() - int(ms * 1_000_000))
     if span is None:
         return
     with _failsafe("claim gate span"):
         _set_attr(span, _OI_INPUT_VALUE, _capture_text(_content_text(answer)))
         _set_attr(span, _OI_INPUT_MIME, _MIME_TEXT)
-        _set_attr(span, _OI_OUTPUT_VALUE, _capture_text(str(nudge)) if nudge else "OK — answer accepted")
+        output = nudge or replacement
+        _set_attr(span, _OI_OUTPUT_VALUE, _capture_text(str(output)) if output else "OK — answer accepted")
         _set_attr(span, _OI_OUTPUT_MIME, _MIME_TEXT)
-        _set_metadata(span, {"verdict": verdict or "OK", "detail": detail, "rule_hit": rule_hit,
-                             "judge": judge, "judge_error": judge_error or None,
+        _set_metadata(span, {"verdict": verdict or "OK", "detail": detail, "action": action,
+                             "receipts": receipts or None,
                              "duration_ms": round(ms, 1) if ms else None, "attempt": attempt})
-        if judge_input is not None:
-            _emit_judge_span(state, span, judge_input=judge_input, judge_reply=judge_reply,
-                             judge=judge, judge_error=judge_error, started=judge_started, ended=judge_ended)
         _end_span(span)
-
-
-def _emit_judge_span(state: TraceState, gate_span: Any, *, judge_input: Any, judge_reply: Any, judge: str,
-                     judge_error: str, started: Any, ended: Any) -> None:
-    """The judge's own LLM call, nested under the claim gate: what it read and what it answered."""
-    sdk = _load_sdk()
-    if sdk is None:
-        return
-    start_ns = int(started * 1e9) if isinstance(started, (int, float)) else None
-    end_ns = int(ended * 1e9) if isinstance(ended, (int, float)) else None
-    name = "Judge" + (f" ({judge})" if judge and judge != "ok" else "")
-    span = _start_child(state, name=name, kind=_KIND_LLM, context=sdk["set_span_in_context"](gate_span),
-                        start_time=start_ns)
-    if span is None:
-        return
-    try:
-        from agent.claim_stop import _JUDGE_INSTRUCTIONS as instructions
-    except Exception:
-        instructions = ""
-    reply = _parse_args(judge_reply) if judge_reply else None
-    _set_messages(span, "llm.input_messages", [{"role": "system", "content": instructions},
-                                               {"role": "user", "content": str(judge_input)}])
-    _set_attr(span, _OI_INPUT_VALUE, _capture_text(str(judge_input)))
-    _set_attr(span, _OI_INPUT_MIME, _MIME_TEXT)
-    if isinstance(reply, (dict, list)):
-        _set_attr(span, _OI_OUTPUT_VALUE, _capture_json(reply))
-        _set_attr(span, _OI_OUTPUT_MIME, _MIME_JSON)
-    else:
-        _set_attr(span, _OI_OUTPUT_VALUE, _capture_text(str(judge_reply or f"ERROR: {judge_error or judge}")))
-        _set_attr(span, _OI_OUTPUT_MIME, _MIME_TEXT)
-    if judge_reply:
-        _set_messages(span, "llm.output_messages", [{"role": "assistant", "content": str(judge_reply)}])
-    if judge != "ok":
-        _mark_error(span, judge_error or judge)
-    with _failsafe("judge span end"):
-        span.end(end_time=end_ns)
 
 
 def register(ctx) -> None:

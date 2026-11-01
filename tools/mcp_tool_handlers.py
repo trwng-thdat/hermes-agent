@@ -71,6 +71,10 @@ _SESSION_OUTCOME_UNCERTAIN_MSG = (
     "UNKNOWN — the operation may or may not have taken effect server-side. It was NOT automatically retried to "
     "avoid a duplicate side effect. The connection has {state}. Verify whether the operation took effect (e.g. "
     "with a read-only tool) before re-invoking it.")
+_WRITE_TIMEOUT_OUTCOME_UNCERTAIN_MSG = (
+    "The write-capable call to '{s}' got no response in time ({e}), so the outcome is UNKNOWN — the server "
+    "may still have applied it. It was NOT retried. Check the current state with a read-only tool before "
+    "re-invoking it, and do not tell the user it succeeded or failed until you know.")
 
 
 def _tool_is_read_only(server_name: str, tool_name: str) -> bool:
@@ -282,6 +286,18 @@ def _handle_session_expired_and_retry(server_name: str, exc: BaseException, retr
                        "falling through to error response.", server_name)
         return None
     return _retry_once(server_name, retry_call, op_description, "session reconnect")
+
+
+def _handle_write_timeout(server_name: str, exc: BaseException, retry_call, op_description: str):
+    """A write-capable call that timed out was dispatched: the server may still apply it, so the
+    outcome is UNKNOWN (never replayed, never reported as a plain failure). None = not a timeout."""
+    if not isinstance(exc, TimeoutError):
+        return None
+    _core._bump_server_error(server_name)
+    logger.warning("MCP server '%s': %s timed out after dispatch; outcome unknown, not retried.",
+                   server_name, op_description)
+    return tool_error(_WRITE_TIMEOUT_OUTCOME_UNCERTAIN_MSG.format(s=server_name, e=_exc_str(exc)),
+                      outcome_uncertain=True, server=server_name)
 
 
 class _StdioChildExited(RuntimeError):
@@ -633,10 +649,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             _core._bump_server_error(server_name)
             logger.error("MCP tool %s/%s call failed: %s", server_name, tool_name, exc)
         session_expired = partial(_handle_session_expired_and_retry, call_may_have_side_effects=not read_only)
-        return _dispatch(
-            server_name, server, op, _call, tool_timeout,
-            (_handle_stdio_child_exited_and_retry, _handle_auth_error_and_retry, session_expired),
-            _on_failure, record_outcome=True)
+        recoverers = (_handle_stdio_child_exited_and_retry, _handle_auth_error_and_retry, session_expired)
+        if not read_only:
+            recoverers += (_handle_write_timeout,)
+        return _dispatch(server_name, server, op, _call, tool_timeout, recoverers, _on_failure, record_outcome=True)
     return _handler
 
 

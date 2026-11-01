@@ -973,6 +973,13 @@ def _detect_tool_failure(tool_name: str, result: Any) -> tuple[bool, str]:
     if is_guardrail_refusal(data):
         return False, ""
 
+    # A write's execution receipt (agent.execution_ledger) is the runtime's own verdict.
+    receipt = data.get("_receipt") if isinstance(data, dict) else None
+    if isinstance(receipt, dict) and receipt.get("status") in ("SUCCEEDED", "FAILED", "UNKNOWN"):
+        if receipt["status"] == "SUCCEEDED":
+            return False, ""
+        return True, f" [{_trim_error(str(receipt.get('error') or receipt['status'].lower()))}]"
+
     # A denied/timed-out approval carries one human sentence; show it instead of the model-facing
     # "BLOCKED: ... Do NOT retry" text (which stays in the JSON for the model).
     if isinstance(data, dict) and data.get("user_summary"):
@@ -996,6 +1003,15 @@ def _detect_tool_failure(tool_name: str, result: Any) -> tuple[bool, str]:
         err = data.get("error") or data.get("message")
         if err and (failed or "error" in data):
             return True, f" [{_trim_error(str(err))}]"
+        # An MCP text result carries the API body as a JSON string under "result"; a 2xx body
+        # can still report a failure (success=false, statusCode>=400, status FAILED).
+        if "result" in data or "structuredContent" in data:
+            from agent.execution_ledger import body_failure, response_body
+
+            body = response_body(data)
+            reason = body_failure(body) if body is not data else None
+            if reason:
+                return True, f" [{_trim_error(reason)}]"
     # Multimodal results (dicts) are successes; failures arrive as JSON-encoded strings.
     if isinstance(result, str) and (
         '"error"' in result[:500].lower() or '"failed"' in result[:500].lower() or result.startswith("Error")
