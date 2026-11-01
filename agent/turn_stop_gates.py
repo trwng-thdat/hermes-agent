@@ -3,7 +3,8 @@
 When the model stops with a text answer, four gates may instead append the answer as an
 interim row plus a synthetic user-role nudge and continue the turn: verify-on-stop (#65919),
 the ``pre_verify`` plugin hook after code edits, the kanban worker terminal-tool guard, and the
-chat claim gate (``agent.claim_stop``), which retracts an unsupported answer instead.
+chat claim gate (``agent.claim_stop``), which retracts an unsupported answer instead, or replaces
+it with a summary of this turn's execution receipts once its retries are spent.
 The first three keep the candidate answer as a budget-exhaustion fallback
 (``pending_verification_response``) and clears ``final_response`` so the finalizer can tell
 this gate from error exits (#61631). Nothing here imports ``agent.conversation_loop`` at
@@ -93,54 +94,53 @@ def _kanban_stop_nudge(agent, messages) -> Optional[str]:
         return None
 
 
-def _claim_stop_nudge(
+def _claim_stop_check(
     agent, messages, final_response, current_turn_user_idx, api_call_count
-) -> Optional[str]:
-    """Chat answers must be backed by this turn's tool results (agent.claim_stop). Skipped once
-    the cap is hit, on interrupt, and when the budget can't fund another call — so the budget
-    fallback never meets a retracted answer."""
+) -> Optional[tuple]:
+    """Chat answers that report an action as done must be backed by this turn's execution
+    receipts (agent.claim_stop). ``("nudge", text)`` retracts the answer for a retry;
+    ``("replace", text)`` delivers the receipts summary instead once the nudge cap is hit or the
+    budget can't fund another call; None lets the answer out. Decided in code, no LLM call."""
     try:
         from agent.claim_stop import (
-            build_claim_nudge, check_answer, claim_gate_enabled, claim_judge_enabled, max_claim_nudges,
-            turn_tool_results, turn_writes,
+            build_claim_nudge, build_fallback_answer, check_answer, claim_gate_enabled, max_claim_nudges,
+            turn_receipts,
         )
 
-        if not final_response or not claim_gate_enabled(agent):
-            return None
-        attempts = getattr(agent, "_claim_stop_nudges", 0)
-        if attempts >= max_claim_nudges() or getattr(agent, "_interrupt_requested", False):
-            return None
-        budget = getattr(agent, "iteration_budget", None)
-        if (api_call_count or 0) + 1 >= agent.max_iterations or (
-            budget is not None and budget.remaining <= 1
-        ):
+        if not final_response or not claim_gate_enabled(agent) or getattr(agent, "_interrupt_requested", False):
             return None
         if current_turn_user_idx is None:
             from agent.turn_context import reanchor_current_turn_user_idx
             current_turn_user_idx = reanchor_current_turn_user_idx(messages, None)
         started = time.monotonic()
-        hit = check_answer(
-            agent, messages, final_response, current_turn_user_idx, judge=claim_judge_enabled()
-        )
-        nudge = None
+        attempts = getattr(agent, "_claim_stop_nudges", 0)
+        hit = check_answer(agent, messages, final_response, current_turn_user_idx)
+        action = None
+        receipts = []
         if hit is not None:
             kind, detail = hit
-            logger.info("claim gate nudge issued (attempt %d) kind=%s detail=%s", attempts + 1, kind, detail)
-            done, failed = turn_writes(turn_tool_results(messages, current_turn_user_idx))
+            receipts = turn_receipts(agent, messages, current_turn_user_idx)
             idx = current_turn_user_idx if isinstance(current_turn_user_idx, int) else -1
             user_msg = messages[idx] if 0 <= idx < len(messages) else None
             user_text = str(user_msg.get("content") or "") if isinstance(user_msg, dict) else ""
-            nudge = build_claim_nudge(kind, detail, done_writes=done, failed_writes=failed, user_text=user_text)
-        _emit_claim_gate_hook(agent, final_response, hit, nudge, attempts + 1, started)
-        return nudge
+            budget = getattr(agent, "iteration_budget", None)
+            can_retry = attempts < max_claim_nudges() and (api_call_count or 0) + 1 < agent.max_iterations and (
+                budget is None or budget.remaining > 1
+            )
+            if can_retry:
+                action = ("nudge", build_claim_nudge(kind, detail, receipts=receipts, user_text=user_text))
+            else:
+                action = ("replace", build_fallback_answer(receipts, user_text))
+            logger.info("claim gate %s (attempt %d) kind=%s detail=%s", action[0], attempts + 1, kind, detail)
+        _emit_claim_gate_hook(agent, final_response, hit, action, receipts, attempts + 1, started)
+        return action
     except Exception:
         logger.info("claim gate check failed open", exc_info=True)
         return None
 
 
-def _emit_claim_gate_hook(agent, answer, hit, nudge, attempt, started) -> None:
+def _emit_claim_gate_hook(agent, answer, hit, action, receipts, attempt, started) -> None:
     """Observability (Phoenix GUARDRAIL span): what the gate checked and decided. Fail-open."""
-    trace = getattr(agent, "_claim_trace", None) or {}
     try:
         from hermes_cli.plugins import invoke_hook
 
@@ -150,11 +150,11 @@ def _emit_claim_gate_hook(agent, answer, hit, nudge, attempt, started) -> None:
             session_id=getattr(agent, "session_id", "") or "",
             turn_id=getattr(agent, "_current_turn_id", "") or "",
             answer=answer, verdict=hit[0] if hit else "OK", detail=hit[1] if hit else None,
-            rule_hit=trace.get("rule_hit"), judge=trace.get("judge", ""),
-            judge_error=trace.get("judge_error", ""), judge_input=trace.get("judge_input"),
-            judge_reply=trace.get("judge_reply"), judge_started=trace.get("judge_started"),
-            judge_ended=trace.get("judge_ended"),
-            duration_ms=round((time.monotonic() - started) * 1000, 1), nudge=nudge, attempt=attempt,
+            action=action[0] if action else None,
+            nudge=action[1] if action and action[0] == "nudge" else None,
+            replacement=action[1] if action and action[0] == "replace" else None,
+            receipts=[r.to_dict() for r in receipts],
+            duration_ms=round((time.monotonic() - started) * 1000, 1), attempt=attempt,
         )
     except Exception:
         logger.debug("claim_gate hook failed", exc_info=True)
@@ -169,6 +169,13 @@ def _append_interim_answer(agent, final_msg, messages, conversation_history, flu
         agent._flush_messages_to_session_db(messages, conversation_history)
     except Exception:
         logger.debug(flush_fail_msg, exc_info=True)
+
+
+def _emit_answer_retracted(agent) -> None:
+    try:
+        agent._emit_status_kind("answer_retracted", "answer retracted", origin="claim_gate")
+    except Exception:
+        logger.debug("answer_retracted status emit failed", exc_info=True)
 
 
 def apply_stop_gates(
@@ -246,20 +253,24 @@ def apply_stop_gates(
         )
         return verdict
 
-    _claim_nudge = _claim_stop_nudge(agent, messages, final_response, current_turn_user_idx, api_call_count)
-    if _claim_nudge:
+    _claim = _claim_stop_check(agent, messages, final_response, current_turn_user_idx, api_call_count)
+    if _claim and _claim[0] == "nudge":
         agent._claim_stop_nudges = getattr(agent, "_claim_stop_nudges", 0) + 1
         # Retracted: in context for the retry only — never persisted, emitted as interim or
         # reused as the fallback; the client drops the text it already streamed.
         final_msg["finish_reason"] = "claim_check_required"
         final_msg["_claim_rejected"] = True
         append_message(messages, final_msg)
-        verdict = _continue(_claim_nudge, "_claim_stop_synthetic", fallback=False)
-        try:
-            agent._emit_status_kind("answer_retracted", "answer retracted", origin="claim_gate")
-        except Exception:
-            logger.debug("answer_retracted status emit failed", exc_info=True)
+        verdict = _continue(_claim[1], "_claim_stop_synthetic", fallback=False)
+        _emit_answer_retracted(agent)
         return verdict
+    if _claim and _claim[0] == "replace":
+        # Out of retries: only what the receipts prove reaches the user.
+        final_response = _claim[1]
+        final_msg["content"] = final_response
+        if "api_content" in final_msg:
+            final_msg["api_content"] = final_response
+        _emit_answer_retracted(agent)
     return StopGateVerdict(
         continue_turn=False, final_response=final_response,
         pending_verification_response=pending_verification_response,

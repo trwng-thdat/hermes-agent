@@ -290,6 +290,11 @@ class StreamDeliveryMixin:
             # See #65991.
             self._note_dropped_stream_writer("_fire_stream_delta")
             return
+        # After a write this turn the chat claim gate withholds the answer until it is checked;
+        # message.complete then carries it whole, so a retracted answer is never shown.
+        from agent.claim_stop import hold_answer_stream
+        if hold_answer_stream(self):
+            return
         # One paragraph break before the first text delta after a tool iteration, without
         # stacking blank lines across back-to-back tool iterations.
         prepended_break = bool(getattr(self, "_stream_needs_break", False) and text and text.strip())

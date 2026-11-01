@@ -7,25 +7,28 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent import claim_stop
 from agent.claim_stop import (
+    UNBACKED_CLAIM,
+    UNREPORTED_FAILURE,
     build_claim_nudge,
+    build_fallback_answer,
+    check_answer,
     claim_gate_enabled,
-    claim_judge_enabled,
+    find_claims,
     find_completion_claim,
+    is_question,
     is_write_tool,
-    judge_grounding,
-    unsourced_values,
     max_claim_nudges,
-    parse_judge_reply,
+    turn_receipts,
     turn_tool_results,
     unwrap_tool_result,
 )
+from agent.execution_ledger import FAILED, SUCCEEDED, UNKNOWN, Receipt
 
 
 @pytest.fixture(autouse=True)
 def _clear_env(monkeypatch):
-    for var in ("HERMES_CLAIM_GATE", "HERMES_CLAIM_JUDGE", "HERMES_KANBAN_TASK"):
+    for var in ("HERMES_CLAIM_GATE", "HERMES_KANBAN_TASK"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -83,6 +86,12 @@ def test_read_tools(name):
     "I have created the ticket.",
     "Đã tạo nhóm thành công.",
     "Không lo, tạo thành công rồi.",
+    "Mình đã gắn tag VIP cho khách.",
+    "Đã gán ticket cho Lan.",
+    "Ticket đã được chuyển sang bộ phận kỹ thuật.",
+    "Xong rồi nhé!",
+    "Tag updated, all done.",
+    "I've tagged the contact as VIP.",
 ])
 def test_detects_claim(text):
     assert find_completion_claim(text) is not None
@@ -106,6 +115,12 @@ def test_detects_claim(text):
     "The group couldn't be sent successfully.",
     "The tool failed to create it successfully.",
     "The group has not yet been created.",
+    "Mình không thể xác nhận email đã gửi.",
+    "Chưa thể cập nhật tag VIP cho khách hàng thành công.",
+    "Email đã gửi không thành công.",
+    "Khi xong mình sẽ báo bạn.",
+    "Sau khi bạn xác nhận, mình sẽ gửi thành công cho cả nhóm.",
+    "I'll let you know once it's done.",
     "",
 ])
 def test_no_claim(text):
@@ -183,121 +198,148 @@ def test_turn_tool_results_skips_flagged_rows():
     assert turn_tool_results(messages, 0) == []
 
 
-# --- judge -----------------------------------------------------------------------------------
+# --- claim kinds and questions ---------------------------------------------------------------
 
-def test_parse_judge_reply_ok():
-    reply = parse_judge_reply('{"verdict": "CONTRADICTED", "issues": [{"claim": "6 tickets", "why": "tool says 5"}]}')
-    assert reply == {"verdict": "CONTRADICTED", "issues": [{"claim": "6 tickets", "why": "tool says 5"}]}
-
-
-def test_parse_judge_reply_embedded_in_prose():
-    assert parse_judge_reply('Sure:\n{"verdict":"OK","issues":[]}\nDone')["verdict"] == "OK"
+def test_claim_kinds():
+    assert [k for _, k in find_claims("Đã gửi email. Đã gắn tag VIP. Đã xoá ghi chú.")] == ["send", "update", "delete"]
+    assert [k for _, k in find_claims("Tạo chiến dịch thành công.")] == [""]
 
 
-@pytest.mark.parametrize("text", [
-    "", "garbage", '{"verdict": "CONTRA', '{"verdict": "MAYBE", "issues": []}', "[1, 2]", None,
+@pytest.mark.parametrize("text,expected", [
+    ("Đã gửi email cho khách chưa?", True),
+    ("có bao nhiêu ticket đang mở", True),
+    ("How many tickets are open", True),
+    ("gắn tag VIP cho khách Nam", False),
+    ("Gửi email giúp mình được không?", False),
+    ("ok làm đi", False),
 ])
-def test_parse_judge_reply_garbage(text):
-    assert parse_judge_reply(text) is None
+def test_is_question(text, expected):
+    assert is_question(text) is expected
 
 
-def _agent(**kw):
-    base = dict(_cached_system_prompt="sys", _current_main_runtime=lambda: {"model": "m"})
-    base.update(kw)
-    return SimpleNamespace(**base)
+# --- check_answer ----------------------------------------------------------------------------
+
+_TAG = "mcp__helpdesk__post_customer_by_customer_id_tags"
+_MAIL = "mcp__helpdesk__post_marketing_broadcasts_send"
 
 
-def test_judge_grounding_calls_oneshot(monkeypatch):
-    seen = {}
+def _turn(user, *calls):
+    """``calls``: (call_id, tool, result_body) rows after one user message."""
+    msgs = [{"role": "user", "content": user}]
+    if calls:
+        msgs.append({"role": "assistant", "content": "", "tool_calls": [_call(c, n) for c, n, _ in calls]})
+        msgs += [{"role": "tool", "tool_call_id": c, "content": _wrap(n, body)} for c, n, body in calls]
+    return msgs
 
-    def fake(**kwargs):
-        seen.update(kwargs)
-        return json.dumps({"verdict": "UNSOURCED", "issues": [{"claim": "hotline 1900", "why": "no source"}]})
 
-    monkeypatch.setattr("agent.oneshot.run_oneshot", fake)
-    verdict = judge_grounding(
-        _agent(), user_text="hotline?", answer="Hotline là 1900 1234.", tool_results=[],
-        history=[], rule_hint=None,
+_AGENT = SimpleNamespace(_current_turn_id="t1", _execution_ledger=None)
+_OK = json.dumps({"result": json.dumps({"status": "OK", "data": {"tagID": "vip"}, "message": "Tạo thành công"})})
+
+
+def test_scenario1_tool_never_called_rejects_claim():
+    messages = _turn("gắn tag VIP cho khách Nam")
+    assert check_answer(_AGENT, messages, "Mình đã gắn tag VIP cho khách Nam.", 0) == (
+        UNBACKED_CLAIM, "Mình đã gắn tag VIP cho khách Nam.",
     )
-    assert verdict["verdict"] == "UNSOURCED"
-    assert seen["task"] == "claim_gate" and seen["temperature"] == 0 and seen["max_tokens"] == 300
-    assert seen["reasoning_config"] == {"enabled": False}
-    assert seen["main_runtime"] == {"model": "m"}
-    assert "Hotline là 1900 1234." in seen["user_input"]
 
 
-def test_judge_grounding_fails_open(monkeypatch):
-    def boom(**_kw):
-        raise RuntimeError("no provider")
-
-    monkeypatch.setattr("agent.oneshot.run_oneshot", boom)
-    assert judge_grounding(
-        _agent(), user_text="q", answer="a", tool_results=[], history=[], rule_hint=None
-    ) is None
-    monkeypatch.setattr("agent.oneshot.run_oneshot", lambda **_kw: '{"verdict": "O')
-    assert judge_grounding(
-        _agent(), user_text="q", answer="a", tool_results=[], history=[], rule_hint=None
-    ) is None
+def test_scenario2_success_with_authoritative_response_passes():
+    messages = _turn("gắn tag VIP cho khách Nam", ("c1", _TAG, _OK))
+    assert check_answer(_AGENT, messages, "Mình đã gắn tag VIP cho khách Nam.", 0) is None
+    (receipt,) = turn_receipts(_AGENT, messages, 0)
+    assert receipt.status == SUCCEEDED and receipt.verified
 
 
-def test_judge_grounding_clips_tool_results(monkeypatch):
-    seen = {}
-    monkeypatch.setattr(
-        "agent.oneshot.run_oneshot", lambda **kw: seen.update(kw) or '{"verdict":"OK","issues":[]}'
+def test_scenario3_tool_failure_rejects_claim():
+    messages = _turn("gắn tag VIP cho khách Nam", ("c1", _TAG, '{"error": "404: Customer not found"}'))
+    assert check_answer(_AGENT, messages, "Đã gắn tag VIP.", 0)[0] == UNBACKED_CLAIM
+    # 200 with a failure body is a failure too.
+    messages = _turn("gắn tag VIP", ("c1", _TAG, json.dumps({"result": '{"success": false, "message": "tag locked"}'})))
+    assert check_answer(_AGENT, messages, "Đã gắn tag VIP.", 0)[0] == UNBACKED_CLAIM
+    assert check_answer(_AGENT, messages, "Gắn tag VIP thất bại vì tag đang bị khoá.", 0) is None
+
+
+def test_scenario4_timeout_is_unknown_and_rejects_claim():
+    body = '{"error": "MCP call timed out after 30.0s", "outcome_uncertain": true}'
+    messages = _turn("gắn tag VIP", ("c1", _TAG, body))
+    (receipt,) = turn_receipts(_AGENT, messages, 0)
+    assert receipt.status == UNKNOWN
+    assert check_answer(_AGENT, messages, "Đã gắn tag VIP thành công.", 0)[0] == UNBACKED_CLAIM
+
+
+def test_scenario6_partial_failure_must_be_reported():
+    messages = _turn(
+        "gắn tag VIP và gửi email cho khách",
+        ("c1", _TAG, _OK), ("c2", _MAIL, '{"error": "400: Kênh email chưa được cấu hình"}'),
     )
-    big = [("t%d" % i, True, "x" * 10_000) for i in range(6)]
-    judge_grounding(_agent(), user_text="q", answer="a", tool_results=big, history=[], rule_hint=None)
-    assert seen["user_input"].count("x") <= claim_stop._TOOL_RESULTS_TOTAL + 50
+    assert check_answer(_AGENT, messages, "Đã gắn tag VIP. Mọi thứ hoàn tất!", 0)[0] == UNREPORTED_FAILURE
+    assert check_answer(
+        _AGENT, messages, "Đã gắn tag VIP, nhưng gửi email thất bại vì kênh chưa cấu hình.", 0
+    ) is None
 
 
-def test_unsourced_values():
-    evidence = "hotline 1900 1234 · ticket #48213 · giá 3500000đ · https://jarvis.cx/docs · cs@jarvis.cx · 2026-10-29"
-    assert unsourced_values("Gọi 1900 1234, ticket 48213, giá 3.500.000đ.", evidence) == []
-    assert unsourced_values("Xem https://jarvis.cx/docs hoặc mail cs@jarvis.cx.", evidence) == []
-    assert unsourced_values("Năm 2026 có 12 ticket.", evidence, "user: có bao nhiêu ticket? tool: 12 open") == []
-    # A small count is checked against this turn only: "6" in the system prompt does not back it.
-    assert unsourced_values("Có 6 ticket.", evidence + " mục 6", "tool: 5 open") == ["6"]
-    assert unsourced_values("Các bước:\n1. Mở cài đặt\n2. Đổi mật khẩu", evidence, "") == []
-    assert unsourced_values("Hotline là 1800 5678.", evidence) == ["1800", "5678"]
-    assert unsourced_values("Xem https://evil.example/x hoặc sales@acme.vn.", evidence) == [
-        "https://evil.example/x", "sales@acme.vn",
-    ]
+def test_claim_of_another_action_is_unbacked():
+    messages = _turn("xoá tag VIP", ("c1", _TAG, _OK))
+    assert check_answer(_AGENT, messages, "Đã xoá tag VIP.", 0) == (UNBACKED_CLAIM, "Đã xoá tag VIP.")
+
+
+def test_question_turn_answered_from_history_passes():
+    messages = _turn("Đã gắn tag VIP cho khách Nam chưa?")
+    assert check_answer(_AGENT, messages, "Đã gắn tag VIP cho khách Nam từ hôm qua.", 0) is None
+
+
+def test_subagent_turn_is_skipped():
+    messages = _turn("gửi email", ("c1", "delegate_task", '{"result": "ok"}'))
+    assert check_answer(_AGENT, messages, "Đã gửi email.", 0) is None
+
+
+def test_live_ledger_receipt_wins_over_transcript():
+    from agent.execution_ledger import ExecutionLedger
+
+    ledger = ExecutionLedger(turn_id="t1")
+    ledger.record(Receipt("c1", _TAG, FAILED, True, "d", error="postcondition not met"))
+    agent = SimpleNamespace(_current_turn_id="t1", _execution_ledger=ledger)
+    messages = _turn("gắn tag VIP", ("c1", _TAG, _OK))
+    assert check_answer(agent, messages, "Đã gắn tag VIP.", 0)[0] == UNBACKED_CLAIM
+
+
+# --- nudge and fallback ----------------------------------------------------------------------
+
+def _receipt(cid, tool, status, error=""):
+    return Receipt(cid, tool, status, status != UNKNOWN, cid, error=error)
 
 
 def test_build_claim_nudge():
-    nudge = build_claim_nudge("UNBACKED_CLAIM", "Đã gửi email.")
+    nudge = build_claim_nudge(UNBACKED_CLAIM, "Đã gửi email.")
     assert "Đã gửi email." in nudge
-    assert "Call the appropriate tool now" not in nudge
     assert "user's language" in nudge
-    assert "Vietnamese" in build_claim_nudge("UNBACKED_CLAIM", "x", user_text="Gửi tin cho khách giúp mình")
+    assert "Vietnamese" in build_claim_nudge(UNBACKED_CLAIM, "x", user_text="Gửi tin cho khách giúp mình")
     assert "Clarify:" in nudge  # named as a forbidden opener
     assert "do not acknowledge, thank or apologise to it" in nudge
-    assert "never attempted" in nudge
-    issues = build_claim_nudge("CONTRADICTED", [{"claim": "6 tickets", "why": "tool returned 5"}])
-    assert "6 tickets" in issues and "tool returned 5" in issues
 
 
-def test_build_claim_nudge_lists_done_and_failed_writes():
-    nudge = build_claim_nudge(
-        "UNBACKED_CLAIM", "Đã tạo nhóm.",
-        done_writes=["helpdesk_post_api_v1_mail"], failed_writes=["create_zalo_group"],
-    )
-    assert "helpdesk_post_api_v1_mail" in nudge and "do not call them again" in nudge
-    assert "create_zalo_group" in nudge and "do not retry" in nudge
-    plain = build_claim_nudge("UNBACKED_CLAIM", "Đã tạo nhóm.")
-    assert "do not call them again" not in plain and "do not retry" not in plain
+def test_build_claim_nudge_lists_ledger_state():
+    nudge = build_claim_nudge(UNREPORTED_FAILURE, "Đã xong.", receipts=[
+        _receipt("c1", _TAG, SUCCEEDED), _receipt("c2", _MAIL, FAILED, "400: no channel"),
+        _receipt("c3", "mcp__helpdesk__put_ticket", UNKNOWN),
+    ])
+    assert f"{_TAG} (c1)" in nudge and "do not call them again" in nudge
+    assert "400: no channel" in nudge and "FAILED" in nudge
+    assert "mcp__helpdesk__put_ticket (c3)" in nudge and "check the current state with a read tool" in nudge
+    plain = build_claim_nudge(UNBACKED_CLAIM, "Đã tạo nhóm.")
+    assert "do not call them again" not in plain and "UNKNOWN" not in plain
 
 
-def test_turn_writes_split_by_outcome():
-    results = [
-        ("mcp__jarvis_mcp__create_zalo_group", False, "{}"),
-        ("helpdesk_post_api_v1_mail", True, "{}"),
-        ("list_department_members", True, "{}"),
-        ("create_zalo_group", False, "{}"),
-    ]
-    assert claim_stop.turn_writes(results) == (
-        ["helpdesk_post_api_v1_mail"], ["mcp__jarvis_mcp__create_zalo_group", "create_zalo_group"],
-    )
+def test_fallback_answer_states_only_receipts():
+    text = build_fallback_answer([
+        _receipt("c1", _TAG, SUCCEEDED), _receipt("c2", _MAIL, FAILED, "400: no channel"),
+        _receipt("c3", "mcp__helpdesk__put_ticket", UNKNOWN),
+    ], user_text="gắn tag và gửi email giúp mình")
+    assert text.startswith("Mình chưa thể xác nhận")
+    assert "- Đã thực hiện: post customer by customer id tags" in text
+    assert "- Thất bại: post marketing broadcasts send (400: no channel)" in text
+    assert "- Chưa xác nhận được kết quả: put ticket" in text
+    assert "No action was carried out" in build_fallback_answer([], user_text="send it")
 
 
 # --- enable resolution -----------------------------------------------------------------------
@@ -342,11 +384,7 @@ def test_missing_config_defaults_to_auto():
     assert claim_gate_enabled(SimpleNamespace(platform="cron"), config={}) is False
 
 
-def test_judge_flag_and_cap(monkeypatch):
-    assert claim_judge_enabled(config={}) is True
-    assert claim_judge_enabled(config=_cfg(claim_judge=False)) is False
-    monkeypatch.setenv("HERMES_CLAIM_JUDGE", "0")
-    assert claim_judge_enabled(config=_cfg(claim_judge=True)) is False
+def test_nudge_cap():
     assert max_claim_nudges(config={}) == 2
     assert max_claim_nudges(config=_cfg(max_claim_nudges=5)) == 5
     assert max_claim_nudges(config=_cfg(max_claim_nudges="junk")) == 2
@@ -380,3 +418,34 @@ def test_messaging_gateway_drops_retract_status():
     from gateway.run import _prepare_gateway_status_message
 
     assert _prepare_gateway_status_message(None, "answer_retracted", "answer retracted") is None
+
+
+# --- quoted data is not a claim (Phoenix trace 1c2bb4d3, 2026-10-31) ---------------------------
+
+_TAGS = json.dumps({"result": json.dumps({"status": "OK", "data": [
+    {"tagID": "tag_5MKi1a1IMTz0lS", "tagName": "Đã tạo Tenant"}, {"tagID": "tag_x", "tagName": "VIP"},
+]}, ensure_ascii=False)})
+
+
+def test_tag_names_listed_from_a_read_are_not_claims():
+    messages = _turn("Thử lại đi", ("c1", "mcp__helpdesk__get_tags", _TAGS))
+    listing = "Đây là danh sách 33 tag hiện có:\n\n**Khách hàng**\n- Chưa tương tác\n- VIP\n- Đã tạo Tenant\n- Đã có Zalo OA"
+    assert check_answer(_AGENT, messages, listing, 0) is None
+    quoted = 'Ví dụ "Đã tạo Tenant" là tên của một tag, không phải thao tác nào đã thực hiện.'
+    assert check_answer(_AGENT, messages, quoted, 0) is None
+    # A real claim next to the same evidence is still caught.
+    hit = check_answer(_AGENT, messages, "Mình đã gắn tag VIP cho khách Nam.", 0)
+    assert hit == (UNBACKED_CLAIM, "Mình đã gắn tag VIP cho khách Nam.")
+
+
+def test_quoted_phrase_is_not_a_claim():
+    assert find_completion_claim('Trạng thái hiển thị là “Đã gửi”.') is None
+    assert find_completion_claim('Tag "Đã tạo Tenant" có 12 khách.') is None
+
+
+def test_tag_names_in_a_markdown_table_are_not_claims():
+    """Phoenix trace ef49c9f1: the same listing as a table, one tag per row."""
+    messages = _turn("xin chào", ("c1", "mcp__helpdesk__get_tags", _TAGS))
+    table = "Lấy danh sách tag — tổng cộng **33 tag**:\n\n| Tag | Màu |\n|---|---|\n| VIP | — |\n| Đã tạo Tenant | — |"
+    assert check_answer(_AGENT, messages, table, 0) is None
+    assert check_answer(_AGENT, messages, "| Khách Nam | Đã gắn tag VIP |", 0)[0] == UNBACKED_CLAIM

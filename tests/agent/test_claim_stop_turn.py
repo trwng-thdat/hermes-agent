@@ -10,6 +10,7 @@ from run_agent import AIAgent
 
 CLAIM = "Đã gửi email cho khách hàng."
 HONEST = "Chưa gửi được email vì kênh mail đang lỗi."
+FALLBACK_HEAD = "Mình chưa thể xác nhận yêu cầu đã được thực hiện xong."
 
 
 def _response(content):
@@ -33,7 +34,6 @@ def agent(tmp_path, monkeypatch, db):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
     monkeypatch.setenv("HERMES_CLAIM_GATE", "1")
-    monkeypatch.setenv("HERMES_CLAIM_JUDGE", "0")
     with (
         patch("model_tools.get_tool_definitions", return_value=[]),
         patch("model_tools.check_toolset_requirements", return_value={}),
@@ -101,16 +101,17 @@ def test_unbacked_claim_is_retracted_and_corrected(agent, db):
     assert [(m["role"], m["content"]) for m in result["messages"]] == rows
 
 
-def test_gate_skips_when_budget_cannot_fund_retry(agent, db):
+def test_budget_exhausted_replaces_claim_with_receipts_summary(agent, db):
     agent.max_iterations = 1
     agent.iteration_budget.max_total = 1
     result, sent, statuses, _ = _run(agent, [CLAIM])
 
-    assert result["final_response"] == CLAIM
-    assert len(sent) == 1
-    assert not any(kind == "answer_retracted" for kind, _ in statuses)
+    assert result["final_response"].startswith(FALLBACK_HEAD)
+    assert "Chưa có thao tác nào được thực hiện" in result["final_response"]
+    assert len(sent) == 1  # no extra model call
+    assert ("answer_retracted", "answer retracted") in statuses
     agent._handle_max_iterations.assert_not_called()
-    assert _persisted(db, agent) == [("user", "gửi email cho khách"), ("assistant", CLAIM)]
+    assert _persisted(db, agent) == [("user", "gửi email cho khách"), ("assistant", result["final_response"])]
 
 
 def test_retracted_answer_is_never_the_budget_fallback(agent, db):
@@ -137,12 +138,13 @@ def test_retracted_answer_is_never_the_budget_fallback(agent, db):
     assert result["final_response"] != CLAIM
 
 
-def test_cap_lets_the_third_answer_out(agent):
+def test_cap_replaces_the_third_answer(agent):
     result, sent, statuses, _ = _run(agent, [CLAIM, CLAIM, CLAIM])
 
     assert len(sent) == 3
-    assert result["final_response"] == CLAIM
-    assert sum(kind == "answer_retracted" for kind, _ in statuses) == 2
+    assert result["final_response"].startswith(FALLBACK_HEAD)
+    assert CLAIM not in result["final_response"]
+    assert sum(kind == "answer_retracted" for kind, _ in statuses) == 3
 
 
 def test_nudge_counter_resets_next_turn(agent):
@@ -158,62 +160,10 @@ def test_gate_off_lets_claim_through(agent, monkeypatch):
     assert result["final_response"] == CLAIM and len(sent) == 1
 
 
-LONG_FACT = "Hiện có 6 ticket đang mở trong hệ thống hỗ trợ, trong đó 2 ticket ưu tiên cao cần xử lý ngay."
-LONG_FIXED = "Hiện có 5 ticket đang mở trong hệ thống hỗ trợ, trong đó 2 ticket ưu tiên cao cần xử lý ngay."
-
-
-def test_judge_contradiction_then_ok(agent, monkeypatch):
-    monkeypatch.setenv("HERMES_CLAIM_JUDGE", "1")
-    verdicts = iter([
-        {"verdict": "CONTRADICTED", "issues": [{"claim": "6 ticket", "why": "tool returned 5"}]},
-        {"verdict": "OK", "issues": []},
-    ])
-    with patch("agent.claim_stop.judge_grounding", side_effect=lambda *_a, **_kw: next(verdicts)) as judge:
-        result, sent, _, _ = _run(agent, [LONG_FACT, LONG_FIXED], text="có bao nhiêu ticket mở?")
-
-    assert judge.call_count == 2
-    assert result["final_response"] == LONG_FIXED
-    assert "6 ticket" in sent[1][-1]["content"] and "tool returned 5" in sent[1][-1]["content"]
-
-
-def test_judge_ok_overrides_rule_hit(agent, monkeypatch):
-    monkeypatch.setenv("HERMES_CLAIM_JUDGE", "1")
-    with patch("agent.claim_stop.judge_grounding", return_value={"verdict": "OK", "issues": []}) as judge:
-        result, sent, _, _ = _run(agent, [CLAIM])
-    assert judge.call_count == 1
-    assert judge.call_args.kwargs["rule_hint"].startswith("Completion claim")
-    assert result["final_response"] == CLAIM and len(sent) == 1
-
-
-def test_judge_error_fails_open_but_rule_still_applies(agent, monkeypatch):
-    monkeypatch.setenv("HERMES_CLAIM_JUDGE", "1")
-    with patch("agent.oneshot.run_oneshot", side_effect=RuntimeError("no provider")):
-        # No completion claim: judge failure means no nudge.
-        result, sent, _, _ = _run(agent, [LONG_FACT], text="có bao nhiêu ticket mở?")
-        assert result["final_response"] == LONG_FACT and len(sent) == 1
-        # Completion claim: the rule nudges on its own.
-        result, sent, _, _ = _run(agent, [CLAIM, HONEST])
-        assert result["final_response"] == HONEST and len(sent) == 2
-
-
-def test_interrupt_during_judge_skips_nudge(agent, monkeypatch):
-    monkeypatch.setenv("HERMES_CLAIM_JUDGE", "1")
-
-    def judge(*_a, **_kw):
-        agent._interrupt_requested = True
-        return {"verdict": "CONTRADICTED", "issues": [{"claim": "x", "why": "y"}]}
-
-    with patch("agent.claim_stop.judge_grounding", side_effect=judge):
-        _result, sent, statuses, _ = _run(agent, [LONG_FACT], text="có bao nhiêu ticket mở?")
-    assert len(sent) == 1
-    assert not any(kind == "answer_retracted" for kind, _ in statuses)
-
-
 def test_nudge_names_failed_writes(monkeypatch):
-    from agent.turn_stop_gates import _claim_stop_nudge
+    from agent.turn_stop_gates import _claim_stop_check
 
     monkeypatch.setenv("HERMES_CLAIM_GATE", "1")
-    monkeypatch.setenv("HERMES_CLAIM_JUDGE", "0")
 
     def call(cid, name):
         return {"id": cid, "type": "function", "function": {"name": name, "arguments": "{}"}}
@@ -227,8 +177,68 @@ def test_nudge_names_failed_writes(monkeypatch):
         {"role": "tool", "tool_call_id": "c2", "content": '{"result": "3 members"}'},
     ]
     agent = SimpleNamespace(max_iterations=6, iteration_budget=None, _claim_stop_nudges=0)
-    nudge = _claim_stop_nudge(agent, messages, "Đã tạo nhóm Zalo cho bạn.", 0, 1)
+    action, nudge = _claim_stop_check(agent, messages, "Đã tạo nhóm Zalo cho bạn.", 0, 1)
 
-    assert nudge is not None
-    assert "do not retry" in nudge and "mcp__aeo__create_zalo_group" in nudge
+    assert action == "nudge"
+    assert "FAILED this turn" in nudge and "mcp__aeo__create_zalo_group (c1)" in nudge
+    assert "requires at least two member IDs" in nudge
     assert "do not call them again" not in nudge and "list_department_members" not in nudge
+
+
+def test_honest_answer_after_failure_passes(monkeypatch):
+    from agent.turn_stop_gates import _claim_stop_check
+
+    monkeypatch.setenv("HERMES_CLAIM_GATE", "1")
+    messages = [
+        {"role": "user", "content": "tạo nhóm zalo"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "mcp__aeo__create_zalo_group", "arguments": "{}"}},
+        ]},
+        {"role": "tool", "tool_call_id": "c1", "content": '{"error": "requires at least two member IDs"}'},
+    ]
+    agent = SimpleNamespace(max_iterations=6, iteration_budget=None, _claim_stop_nudges=0)
+    assert _claim_stop_check(agent, messages, "Chưa tạo được nhóm Zalo vì cần ít nhất hai thành viên.", 0, 1) is None
+
+
+TAG_TOOL = "mcp__helpdesk__post_customer_by_customer_id_tags"
+
+
+def _tool_response(call_id, args='{"customer_id": "c_456", "tagID": "vip"}'):
+    call = SimpleNamespace(id=call_id, type="function", function=SimpleNamespace(name=TAG_TOOL, arguments=args))
+    msg = SimpleNamespace(content="", tool_calls=[call])
+    return SimpleNamespace(choices=[SimpleNamespace(message=msg, finish_reason="tool_calls")], model="m", usage=None)
+
+
+def test_write_receipt_dedup_and_held_stream_through_the_real_loop(agent):
+    """The model writes, repeats the same write, then answers: the API is hit once, the repeat
+    returns the first receipt, and the answer is withheld from the stream until the gate passes."""
+    import json
+
+    executed = []
+
+    def handle_function_call(name, args, *_a, **_kw):
+        executed.append((name, args))
+        return json.dumps({"result": json.dumps({"status": "OK", "data": {"tagID": "vip"}})})
+
+    queue = iter([_tool_response("c1"), _tool_response("c2"), _response("Đã gắn tag VIP cho khách.")])
+    agent._interruptible_api_call = lambda _kw: next(queue)
+    agent.valid_tool_names = {TAG_TOOL}
+    agent.tools = [{"type": "function", "function": {"name": TAG_TOOL, "parameters": {"type": "object"}}}]
+    with (
+        patch("model_tools.handle_function_call", side_effect=handle_function_call),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("gắn tag VIP cho khách c_456")
+
+    assert len(executed) == 1
+    tool_rows = [m for m in result["messages"] if m.get("role") == "tool"]
+    assert '"status": "SUCCEEDED"' in tool_rows[0]["content"]
+    assert "Not executed again" in tool_rows[1]["content"] and '"dedup_of": "c1"' in tool_rows[1]["content"]
+    assert result["final_response"] == "Đã gắn tag VIP cho khách."
+    streamed = []
+    agent.stream_delta_callback = lambda text: streamed.append(text)
+    agent._fire_stream_delta("sau khi ghi")  # a write ran this turn: held
+    assert streamed == []
+    agent._current_turn_id = "next-turn"  # no write in this turn yet: streams normally
+    agent._fire_stream_delta("lượt mới")
+    assert [t.strip() for t in streamed] == ["lượt mới"]

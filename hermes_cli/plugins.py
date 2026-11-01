@@ -122,8 +122,9 @@ VALID_HOOKS: Set[str] = {
     # (bool verdict), p_needs_tools (float|None), skip_confidence (float|None), model, status, duration_ms.
     "pre_turn_gate",
     # claim_gate: once per checked chat answer (agent.claim_stop) before the turn may end. Observer;
-    # returns ignored. Kwargs: task_id, session_id, turn_id, answer, verdict, detail, rule_hit, judge
-    # (ok|timeout|error|off|skipped), judge_error, duration_ms, nudge (str|None), attempt.
+    # returns ignored. Kwargs: task_id, session_id, turn_id, answer, verdict (OK|UNBACKED_CLAIM|
+    # UNREPORTED_FAILURE), detail, action (nudge|replace|None), nudge (str|None), replacement
+    # (str|None), receipts (list of execution receipt dicts), duration_ms, attempt.
     "claim_gate",
     # pre/post_auxiliary_call: once per physical provider attempt of an auxiliary LLM call
     # (agent/auxiliary_hooks.py — titling, compression, MoA, vision, approval, ...). Same payload

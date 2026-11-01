@@ -87,15 +87,14 @@ def test_turn_tree(spans):
     tool_row = {"role": "tool", "name": "mcp__helpdesk__get_x", "content": '{"error": "not linked"}'}
     phoenix.on_pre_llm_request(api_call_count=2, request_messages=history + [{"role": "assistant"}, tool_row], **ids)
     phoenix.on_post_llm_call(api_call_count=2, assistant_message=_msg("Chưa tra được."), **ids)
-    phoenix.on_claim_gate(answer="Chưa tra được.", verdict="OK", judge="ok", judge_input="ANSWER: …",
-                          judge_reply='{"verdict": "OK", "issues": []}', judge_started=1.0, judge_ended=2.0,
+    phoenix.on_claim_gate(answer="Chưa tra được.", verdict="OK", receipts=[],
                           **{k: ids[k] for k in ("task_id", "session_id", "turn_id")})
     phoenix.on_post_llm_call(assistant_response="Chưa tra được.", **{k: ids[k] for k in ("task_id", "session_id", "turn_id")})
 
     by_name = {s.name: s for s in spans.get_finished_spans()}
     root = by_name["Có bao nhiêu kênh Zalo?"]
     step1, tool, step2 = by_name["1. → helpdesk.get_x"], by_name["helpdesk.get_x"], by_name["2. Trả lời"]
-    gate, judge = by_name["Claim gate: OK"], by_name["Judge"]
+    gate = by_name["Claim gate: OK"]
 
     assert tool.parent.span_id == step1.context.span_id  # tool nests under the step that called it
     assert tool.status.status_code.name == "ERROR"
