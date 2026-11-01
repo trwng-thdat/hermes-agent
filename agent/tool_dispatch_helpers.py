@@ -131,8 +131,9 @@ def _peel_bridge_call(tool_name: str, function_args: dict) -> tuple[str, dict]:
         return tool_name, function_args
 
 
-# Above this a batch keeps the single-entry rejection instead of fanning out into that many calls.
-_MAX_SPLIT_ENTRIES = 8
+# Only a guard against a runaway batch: a lower cap just costs a round, since the rejected model
+# re-sends the same entries as that many parallel tool_calls anyway (a 12-tag count did exactly that).
+_MAX_SPLIT_ENTRIES = 64
 
 
 def split_local_tool_call_batches(tool_calls: list) -> list:
