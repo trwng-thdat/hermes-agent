@@ -51,10 +51,16 @@ def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
             )
         marker = _TEMPLATE_MARKER_RE.search(goal)
         if marker:
+            # The same shape also names a value the subagent only gets while running (a cursor
+            # like `offset=<next_offset>`): there is no real value to substitute, so say how to
+            # write it, or the model re-plans the whole delegation.
+            name = marker.group(0)[1:-1]
             return (
                 f"Task {i} goal contains an unexpanded template marker "
-                f"({marker.group(0)!r}). Substitute the real value before "
-                "calling delegate_task — subagents cannot resolve placeholders."
+                f"({marker.group(0)!r}); subagents cannot resolve placeholders. "
+                "If you know the value, substitute it. If the subagent reads it while running "
+                f"(e.g. from a previous tool result), describe it in words instead, e.g. "
+                f"'the {name} returned by the previous call', and re-send the same tasks."
             )
         if len(goal) < _MIN_BATCH_GOAL_LEN and len(task_list) >= 2:
             return (
