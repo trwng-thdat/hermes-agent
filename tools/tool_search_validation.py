@@ -144,7 +144,25 @@ def normalize_tool_call_entries(args: Dict[str, Any]) -> Tuple[List[Dict[str, An
     (a single call is a batch of one). Each entry's ``arguments`` is coerced to
     a dict (JSON strings parsed, ``None`` → ``{}``). Returns ``(entries, None)``
     or ``([], error_message)``.
+
+    Every rejection restates the valid shape, rebuilt from the caller's own entries
+    when they can be recovered: told only the constraint, small models re-send the
+    same malformed call until the loop guard stops them.
     """
+    entries, err = _normalize_entries(args)
+    if err is None:
+        return entries, None
+    nested = _calls_nested_in_arguments(args)
+    if nested:
+        return [], ("tool_call takes 'calls' at the top level, not inside 'arguments'. "
+                    f"The tool was NOT invoked. {_retry_instruction(nested)}.")
+    return [], f"{err}. The tool was NOT invoked. Shape: {_CALL_SHAPE}"
+
+
+_CALL_SHAPE = '{"calls":[{"name":"<exact tool name>","arguments":{...}}]}'
+
+
+def _normalize_entries(args: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     raw_calls = args.get("calls")
     if raw_calls is None:
         # Legacy single shape.
@@ -190,23 +208,54 @@ def normalize_tool_call_entries(args: Dict[str, Any]) -> Tuple[List[Dict[str, An
     return entries, None
 
 
+def _calls_nested_in_arguments(args: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Entries from the common mis-wrap ``{"arguments": {"calls": [...]}}`` (often a JSON
+    string), where the model nests the whole envelope one level too deep."""
+    if args.get("calls") is not None or str(args.get("name") or "").strip():
+        return []
+    nested = args.get("arguments")
+    if isinstance(nested, str):
+        try:
+            nested = json.loads(nested)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(nested, dict) or nested.get("calls") is None:
+        return []
+    entries, err = _normalize_entries(nested)
+    return [] if err else entries
+
+
 _ECHO_ARGS_MAX_CHARS = 1500
+
+
+def _echo_entry(entry: Dict[str, Any]) -> str:
+    args = json.dumps(entry.get("arguments", {}), ensure_ascii=False, separators=(",", ":"))
+    if len(args) > _ECHO_ARGS_MAX_CHARS:
+        args = "{...}"  # keep the correction readable; the model still has its own arguments
+    return '{"name":%s,"arguments":%s}' % (json.dumps(entry["name"], ensure_ascii=False), args)
+
+
+def _retry_instruction(entries: List[Dict[str, Any]], *, only: bool = False) -> str:
+    """The valid call rebuilt from the caller's OWN entries: the first entry alone when a
+    local tool is involved (local tools take one entry per tool_call), the whole batch
+    when every entry is a connector."""
+    from tools.connectors.gateway.names import is_connector_name
+
+    if only or (len(entries) > 1 and any(not is_connector_name(e["name"]) for e in entries)):
+        remaining = (f" then issue the remaining {len(entries) - 1} call(s) as separate tool_call invocations"
+                     if len(entries) > 1 else "")
+        return f'Retry with only: {{"calls":[{_echo_entry(entries[0])}]}}{remaining}'
+    return 'Retry with: {"calls":[%s]}' % ",".join(_echo_entry(e) for e in entries)
 
 
 def local_batch_error(entries: List[Dict[str, Any]]) -> str:
     """Rejection for a multi-entry batch that names a local tool. Restates the valid
     shape with the caller's OWN first entry: small models re-send an identical batch
     when told only the constraint, and the echoed payload is what gets them unstuck."""
-    first = entries[0]
-    args = json.dumps(first.get("arguments", {}), ensure_ascii=False, separators=(",", ":"))
-    if len(args) > _ECHO_ARGS_MAX_CHARS:
-        args = "{...}"  # keep the correction readable; the model still has its own arguments
-    retry = '{"calls":[{"name":%s,"arguments":%s}]}' % (json.dumps(first["name"], ensure_ascii=False), args)
-    remaining = (f" then issue the remaining {len(entries) - 1} call(s) as separate tool_call invocations"
-                 if len(entries) > 1 else "")
     return (
-        f"tool_call takes exactly one entry for local tools; you sent {len(entries)}. "
-        f"Retry with only: {retry}{remaining}. Only connectors__ names may be batched together."
+        f"tool_call takes exactly one entry for local tools (built-ins and every mcp__* tool); "
+        f"you sent {len(entries)}. {_retry_instruction(entries, only=True)}. "
+        "Only connectors__ names may be batched together."
     )
 
 

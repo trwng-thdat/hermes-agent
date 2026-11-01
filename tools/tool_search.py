@@ -318,8 +318,11 @@ def bridge_tool_schemas(deferred_count: int, listing: Optional[str] = None,
             TOOL_CALL_NAME,
             "Invoke deferred tools. Takes `calls`, an array of {name, arguments} "
             "— one entry per invocation; a single call is an array of one. "
-            "Local tools require one entry per tool_call. Only connectors__ names "
-            "may be batched together; mixed and multi-local batches are rejected. "
+            "Local tools (built-ins and every mcp__* tool) require one entry per "
+            "tool_call: to run several, emit several tool_call invocations in the same "
+            "response. Only connectors__ names may be batched together; mixed and "
+            "multi-local batches are rejected. `calls` is a top-level key, never nested "
+            "inside `arguments`. "
             "Connector entries execute individually with results in input order. "
             f"Argument shapes match each tool's schema (see `{TOOL_DESCRIBE_NAME}`). "
             "Policy, hooks, and approvals run as for directly-listed tools.",

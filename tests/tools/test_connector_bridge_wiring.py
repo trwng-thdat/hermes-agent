@@ -153,6 +153,23 @@ def test_normalize_rejects_malformed_batches(bad, expected_fragment):
     entries, err = normalize_tool_call_entries(bad)
     assert entries == []
     assert expected_fragment in (err or "")
+    assert "The tool was NOT invoked." in err and '"calls":[{"name":' in err
+
+
+@pytest.mark.parametrize("wrap", [json.dumps, lambda envelope: envelope])
+def test_calls_nested_in_arguments_echoes_the_top_level_retry(wrap):
+    """Trace fb4efba4: the model nested the envelope inside `arguments` and re-sent it 8 times
+    while the error only restated the constraint. The rejection now hands back its own call."""
+    one = {"name": "mcp__helpdesk__post_tags", "arguments": {"name": "hihi"}}
+    entries, err = normalize_tool_call_entries({"arguments": wrap({"calls": [one]})})
+    assert entries == []
+    assert "not inside 'arguments'" in err
+    assert 'Retry with: {"calls":[{"name":"mcp__helpdesk__post_tags","arguments":{"name":"hihi"}}]}' in err
+
+    two = {"name": "mcp__helpdesk__search_customers", "arguments": {}}
+    _, err = normalize_tool_call_entries({"arguments": wrap({"calls": [one, two]})})
+    assert 'Retry with only: {"calls":[{"name":"mcp__helpdesk__post_tags"' in err
+    assert "remaining 1 call(s) as separate tool_call invocations" in err
 
 
 # ---------------------------------------------------------------------------
