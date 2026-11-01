@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from agent.message_metadata import append_message
 from agent.message_sanitization import coalesce_tool_call_id
+from agent.tool_dispatch_helpers import split_local_tool_call_batches
 from agent.turn_preflight import compress_after_tool_results
 from agent.turn_tool_validation import validate_tool_calls
 
@@ -86,7 +87,7 @@ def run_tool_round(
 
     # Post-call guardrails.
     assistant_message.tool_calls = agent._deduplicate_tool_calls(
-        agent._cap_delegate_task_calls(assistant_message.tool_calls)
+        agent._cap_delegate_task_calls(split_local_tool_call_batches(assistant_message.tool_calls))
     )
 
     # Mixed batch: the assistant message keeps EVERY emitted call (each tool_call needs a

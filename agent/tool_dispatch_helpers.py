@@ -131,6 +131,81 @@ def _peel_bridge_call(tool_name: str, function_args: dict) -> tuple[str, dict]:
         return tool_name, function_args
 
 
+# Above this a batch keeps the single-entry rejection instead of fanning out into that many calls.
+_MAX_SPLIT_ENTRIES = 8
+
+
+def split_local_tool_call_batches(tool_calls: list) -> list:
+    """Expand each ``tool_call`` that batches local tools into one ``tool_call`` per local entry.
+
+    Local tools (built-ins, every ``mcp__*``) take one entry per ``tool_call``; models still pack
+    several, and the rejection costs a whole LLM round just to re-send them apart. Splitting
+    happens before the assistant message is recorded, so the transcript shows exactly the calls
+    that ran, each paired with its own result, and every entry passes scope, schema probe, hooks,
+    the execution ledger and parallel admission like a call the model emitted on its own. The
+    envelope nested inside ``arguments`` is lifted to the top level the same way. Connector
+    entries stay together in one batch. Returns the original list when nothing was split.
+    """
+    out, changed = [], False
+    for tc in tool_calls or []:
+        parts = _split_bridge_call(tc)
+        if parts is None:
+            out.append(tc)
+            continue
+        out.extend(parts)
+        changed = True
+    return out if changed else tool_calls
+
+
+def _split_bridge_call(tc) -> Optional[list]:
+    import copy
+
+    from agent.message_sanitization import _tc_field, _tc_set
+    from tools.tool_search import TOOL_CALL_NAME, is_connector_name
+    from tools.tool_search_validation import _calls_nested_in_arguments, normalize_tool_call_entries
+
+    function = _tc_field(tc, "function")
+    if _tc_field(function, "name") != TOOL_CALL_NAME:
+        return None
+    # Codex Responses pairing (call_id / composite "call|fc" ids) is left to the rejection path.
+    tc_id = _tc_field(tc, "id")
+    if _tc_field(tc, "call_id") or not isinstance(tc_id, str) or not tc_id.strip() or "|" in tc_id:
+        return None
+    raw = _tc_field(function, "arguments")
+    try:
+        args = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(args, dict):
+        return None
+    entries, err = normalize_tool_call_entries(args)
+    nested = bool(err)
+    if nested:
+        entries = _calls_nested_in_arguments(args)
+        if not entries:
+            return None
+    groups: list = []
+    connectors: list = []
+    for entry in entries:
+        if is_connector_name(entry["name"]):
+            if not connectors:
+                groups.append(connectors)
+            connectors.append(entry)
+        else:
+            groups.append([entry])
+    if (len(groups) == 1 and not nested) or len(groups) > _MAX_SPLIT_ENTRIES:
+        return None
+    parts = []
+    for n, group in enumerate(groups):
+        part = copy.deepcopy(tc)
+        _tc_set(_tc_field(part, "function"), "arguments", json.dumps({"calls": group}, ensure_ascii=False))
+        if n:
+            _tc_set(part, "id", f"{tc_id}_s{n + 1}")
+        parts.append(part)
+    logger.info("Split tool_call %s into %d call(s): %s", tc_id, len(parts),
+                ", ".join(e["name"] for e in entries))
+    return parts
+
 def _batch_admission(tool_call, execution_cwd: Optional[Path]) -> tuple[str, List[Path], bool] | None:
     """Classify one call for the planner: ``None`` = sequential barrier, else
     ``(effective_name, scoped_paths, is_writer)`` (empty paths = unscoped parallel-safe)."""
