@@ -342,6 +342,8 @@ class TraceState:
     tool_errors: int = 0
     started_at: float = field(default_factory=time.time)
     step_of: Dict[int, int] = field(default_factory=dict)
+    # Context of the open delegate_task tool span: the subagents it spawns nest under it.
+    delegate_context: Any = None
 
 
 _STATE_LOCK = threading.Lock()
@@ -356,6 +358,13 @@ _MAX_TRACE_STATE = 256
 # before any LLM call) would otherwise leak one entry per turn.
 _PENDING_GATES: Dict[str, dict] = {}
 _MAX_PENDING_GATES = 256
+
+# A subagent runs its own turn under its own session id. subagent_start records the
+# parent's AGENT span here by child session id, so the child's root opens inside it (one
+# trace, in the parent's project) instead of as a separate top-level trace. Guarded by
+# _STATE_LOCK; popped by subagent_stop, bounded for children that never report back.
+_SUBAGENT_PARENTS: Dict[str, tuple] = {}
+_MAX_SUBAGENT_PARENTS = 256
 
 
 def _trace_key(task_id: str, session_id: str, *, turn_id: str = "", api_request_id: str = "") -> str:
@@ -420,7 +429,10 @@ def _start_root(task_key: str, *, project: str, tracer: Any, task_id: str, sessi
     last_user = next((m for m in reversed(messages) if isinstance(m, dict) and m.get("role") == "user"), None) \
         if isinstance(messages, list) else None
     user_text = _content_text(last_user.get("content")) if last_user is not None else ""
-    span = tracer.start_span(_turn_name(user_text))
+    parent = _SUBAGENT_PARENTS.get(session_id) if session_id else None
+    if parent is not None and _TRACERS.get(parent[0]) is not None:
+        project, tracer = parent[0], _TRACERS[parent[0]]
+    span = tracer.start_span(_turn_name(user_text), context=parent[1] if parent is not None else None)
     _set_attr(span, _OI_SPAN_KIND, _KIND_CHAIN)
     if session_id:
         _set_attr(span, _OI_SESSION_ID, session_id)
@@ -879,6 +891,9 @@ def on_pre_tool_call(*, tool_name: str = "", args: Any = None, task_id: str = ""
         _set_attr(span, _OI_INPUT_MIME, _MIME_JSON)
         _set_metadata(span, {"tool_name": real_name, "dispatcher": tool_name if real_name != tool_name else None,
                              "tool_call_id": tool_call_id})
+        if tool_name == "delegate_task":
+            sdk = _load_sdk()
+            state.delegate_context = sdk["set_span_in_context"](span) if sdk else None
         if tool_call_id:
             state.tools[tool_call_id] = span
         else:
@@ -893,6 +908,8 @@ def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = No
         state = _TRACE_STATE.get(task_key)
         if state is None:
             return
+        if tool_name == "delegate_task":
+            state.delegate_context = None
         span = state.tools.pop(tool_call_id, None) if tool_call_id else None
         queue = state.pending_tools_by_name.get(tool_name) if span is None else None
         if queue:
@@ -990,13 +1007,20 @@ def on_subagent_start(*, parent_turn_id: str = "", parent_subagent_id: Any = Non
         state = _state_for_turn(parent_turn_id)
         if state is None:
             return
-        span = _start_child(state, name=f"Subagent: {child_role or 'delegate'}", kind=_KIND_AGENT)
+        goal = _one_line(_content_text(child_goal), 60)
+        span = _start_child(state, name=f"Subagent: {goal or child_role or 'delegate'}", kind=_KIND_AGENT,
+                            context=state.delegate_context)
         if span is None:
             return
         _set_attr(span, _OI_INPUT_VALUE, _capture_json(child_goal))
         _set_metadata(span, {"child_session_id": child_session_id, "child_subagent_id": child_subagent_id,
                              "child_role": child_role, "parent_subagent_id": parent_subagent_id})
         state.subagents[str(child_session_id)] = span
+        sdk = _load_sdk()
+        if sdk:
+            _SUBAGENT_PARENTS[str(child_session_id)] = (state.project, sdk["set_span_in_context"](span))
+            for key in list(_SUBAGENT_PARENTS)[:max(len(_SUBAGENT_PARENTS) - _MAX_SUBAGENT_PARENTS, 0)]:
+                _SUBAGENT_PARENTS.pop(key, None)
 
 
 def on_subagent_stop(*, parent_turn_id: str = "", child_session_id: Any = None, child_role: str = "",
@@ -1005,6 +1029,7 @@ def on_subagent_stop(*, parent_turn_id: str = "", child_session_id: Any = None, 
     if not child_session_id:
         return
     with _STATE_LOCK:
+        _SUBAGENT_PARENTS.pop(str(child_session_id), None)
         state = _state_for_turn(parent_turn_id)
         span = state.subagents.pop(str(child_session_id), None) if state else None
     if span is None:
