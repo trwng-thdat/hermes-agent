@@ -5,7 +5,8 @@ done ("đã gửi", "successfully") must be backed by this turn's execution rece
 - an action turn (the user asked for something, or a write was attempted) with a completion claim
   and no SUCCEEDED write of a matching kind → retracted and nudged;
 - a claim while a write is still FAILED / UNKNOWN that the answer never mentions → retracted;
-- a question turn ("đã gửi chưa?") answered from history, or an answer with no claim → passes.
+- a question turn ("đã gửi chưa?") answered from history, a read request ("cho tôi danh sách tag")
+  with no write, or an answer with no claim → passes.
 
 Once the nudge cap is hit the answer is replaced by a summary built from the receipts, so a false
 claim never reaches the user. Every failure here fails open. Wired in ``agent.turn_stop_gates``."""
@@ -129,6 +130,19 @@ _EN_VERBS = {
     "update": r"updated|changed|moved|tagged|assigned|closed|enabled|disabled",
     "delete": r"deleted|removed|cancell?ed",
 }
+# Any action verb, as the user would ask for it: a request naming one is an action turn.
+_ACTION_WORD = re.compile(
+    rf"(?<!{_LETTER})(?:{'|'.join(_VI_VERBS.values())})(?!{_LETTER})|"
+    r"\b(?:send|post|publish|create|add|schedule|save|update|change|move|assign|close|enable|disable|delete|"
+    r"remove|cancel)\b",
+    re.I,
+)
+# A read verb in front of a generic "thành công"/"xong" makes it a report about a read.
+_READ_VERB = re.compile(
+    rf"(?<!{_LETTER})(?:lấy|tìm|tra cứu|kiểm tra|tải|đọc|liệt kê|truy vấn)(?!{_LETTER})|"
+    r"\b(?:fetch(?:ed)?|retrieved|found|loaded|listed|read|checked)\b",
+    re.I,
+)
 _KIND_TOOL_VERBS = {
     "send": re.compile(r"(?:^|_)(?:send|post|publish|message|messages|mail|email|broadcasts?|reply)(?:_|$)", re.I),
     "create": re.compile(r"(?:^|_)(?:create|post|add|upsert|schedule|insert|put)(?:_|$)", re.I),
@@ -158,7 +172,7 @@ _HYPOTHETICAL = re.compile(
 )
 # ... as does a failure right after it ("đã gửi không thành công").
 _FAILED_AFTER = re.compile(r"^\W*(?:\w+\s+){0,3}?(?:không thành công|thất bại|failed|unsuccessful)", re.I)
-_CLAUSE_BREAK = re.compile(r"[,;:—–(|]|\s(?:nhưng|tuy nhiên|song|but|however)\s", re.I)
+_CLAUSE_BREAK = re.compile(r"[,;:—–(|]|\s-\s|\s(?:nhưng|tuy nhiên|song|but|however)\s", re.I)
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?…\n])\s*")
 
 
@@ -191,6 +205,8 @@ def _sentence_claim_kinds(sentence: str, evidence: str = "") -> List[str]:
             if _NEGATION.search(before) or _HYPOTHETICAL.search(before) or _FAILED_AFTER.search(after):
                 continue
             if _quoted(sentence, m.start()) or _cited(m.group() + after, evidence):
+                continue
+            if not kind and _READ_VERB.search(before) and not _ACTION_WORD.search(before):
                 continue
             kinds.append(kind)
             break
@@ -238,6 +254,22 @@ def is_question(text: str) -> bool:
     if not text or _POLITE_REQUEST.search(text):
         return False
     return bool(_QUESTION_END.search(text) or _QUESTION_WORD.search(text))
+
+
+# A user message that only asks to see data ("cho tôi danh sách tag", "cho tôi số bài viết các dự
+# án AEO"); naming any action verb ("... rồi gắn VIP cho Nam") makes it an action turn again. A bare
+# confirmation ("ok", "làm đi") names no read either, so it stays gated.
+_READ_REQUEST = re.compile(
+    rf"(?<!{_LETTER})(?:cho (?:tôi|mình|em|anh|chị|tui)|danh sách|liệt kê|xem|tra cứu|tìm|kiểm tra|thống kê|"
+    rf"báo cáo|tổng hợp|thông tin|chi tiết|số liệu|số lượng)(?!{_LETTER})|"
+    r"\b(?:list|show|find|search|look up|check|give me|tell me|report)\b",
+    re.I,
+)
+
+
+def is_read_request(text: str) -> bool:
+    text = unicodedata.normalize("NFC", text or "").strip()
+    return bool(_READ_REQUEST.search(text)) and not _ACTION_WORD.search(text)
 
 
 # --- this turn's tool results --------------------------------------------------------------
@@ -397,8 +429,9 @@ def check_answer(
     if not claims:
         return None
     receipts = turn_receipts(agent, messages, start_idx)
-    if not receipts and is_question(_user_text(messages, start_idx)):
-        return None  # "đã gửi chưa?" answered from earlier turns: nothing to check here
+    user_text = _user_text(messages, start_idx)
+    if not receipts and (is_question(user_text) or is_read_request(user_text)):
+        return None  # "đã gửi chưa?" / "cho tôi danh sách tag": no action asked, nothing to check here
     state = summarize(receipts)
     done = state[SUCCEEDED]
     for sentence, kind in claims:

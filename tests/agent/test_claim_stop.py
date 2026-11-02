@@ -17,6 +17,7 @@ from agent.claim_stop import (
     find_claims,
     find_completion_claim,
     is_question,
+    is_read_request,
     is_write_tool,
     max_claim_nudges,
     turn_receipts,
@@ -449,3 +450,49 @@ def test_tag_names_in_a_markdown_table_are_not_claims():
     table = "Lấy danh sách tag — tổng cộng **33 tag**:\n\n| Tag | Màu |\n|---|---|\n| VIP | — |\n| Đã tạo Tenant | — |"
     assert check_answer(_AGENT, messages, table, 0) is None
     assert check_answer(_AGENT, messages, "| Khách Nam | Đã gắn tag VIP |", 0)[0] == UNBACKED_CLAIM
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("cho tôi danh sách tag", True),
+    ("liệt kê các kênh Zalo", True),
+    ("show me the tags", True),
+    ("cho tôi số bài viết các dự án AEO sau:\n1/ Hoa Tay\n2/ Sunext AI\n3/ Nha Khoa 3c", True),
+    ("cho tôi danh sách tag rồi gắn VIP cho Nam", False),
+    ("gửi email cho khách", False),
+    ("ok làm đi", False),
+])
+def test_is_read_request(text, expected):
+    assert is_read_request(text) is expected
+
+
+def test_read_request_turn_passes_however_the_listing_is_worded():
+    """'cho tôi danh sách tag': a tag paraphrased past its name used to read as a claim, the retry
+    re-called get_tags and the cap replaced the listing with 'Chưa có thao tác nào'."""
+    messages = _turn("cho tôi danh sách tag", ("c1", "mcp__helpdesk__get_tags", _TAGS))
+    listing = "Danh sách tag:\n- VIP\n- Đã tạo Tenant cho khách mới đăng ký"
+    assert check_answer(_AGENT, messages, listing, 0) is None
+    # Asking for an action alongside the read keeps the gate on.
+    messages = _turn("cho tôi danh sách tag rồi gắn VIP cho Nam", ("c1", "mcp__helpdesk__get_tags", _TAGS))
+    assert check_answer(_AGENT, messages, "Đã gắn tag VIP cho Nam.", 0)[0] == UNBACKED_CLAIM
+
+
+def test_report_with_status_words_passes_on_a_read_request():
+    """'đã đăng' in a per-project report reads as a send claim and the JSON keys are English, so
+    nothing in the answer can be cited: the read request is what clears it."""
+    report = json.dumps({"result": json.dumps({"project": "Hoa Tay", "published": 12, "draft": 3})})
+    messages = _turn(
+        "cho tôi số bài viết các dự án AEO sau:\n1/ Hoa Tay", ("c1", "mcp__aeo__get_project_report", report),
+    )
+    assert check_answer(_AGENT, messages, "- Hoa Tay: 12 bài đã đăng, 3 bài nháp.", 0) is None
+
+
+def test_generic_success_about_a_read_is_not_a_claim():
+    assert find_completion_claim("Lấy danh sách tag thành công.") is None
+    assert find_completion_claim("I fetched the tags successfully.") is None
+    # A write verb in the same clause still makes it a claim.
+    assert find_completion_claim("Đã tìm và gửi email thành công.") is not None
+
+
+def test_tag_name_before_a_spaced_dash_is_cited():
+    messages = _turn("Thử lại đi", ("c1", "mcp__helpdesk__get_tags", _TAGS))
+    assert check_answer(_AGENT, messages, "- Đã tạo Tenant - 12 khách", 0) is None
