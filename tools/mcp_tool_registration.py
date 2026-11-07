@@ -361,6 +361,24 @@ def _register_candidates(name: str, candidates: List[_Candidate], *, check_fn: C
     return registered
 
 
+def adopter_scopes(key) -> List[str]:
+    """Profile scopes that adopted the shared connection under *key* (every scope that sees its
+    tools except the owner's own)."""
+    owner = _core._server_registry_scope(key)
+    with _core._lock:
+        return sorted(scope for scope in _core._server_tool_scopes.get(key, ()) if scope and scope != owner)
+
+
+def register_into_adopter_scope(name: str, server: "MCPServerTask", config: dict, key, scope: str) -> List[str]:
+    """Register *server*'s current tools into one adopting profile's *scope*, filtered by that
+    profile's own *config* — an adopter may allow a different subset than the owner."""
+    candidates = _tool_candidates(name, server._tools, _make_tool_filter(name, config), server.tool_timeout)
+    candidates += _utility_candidates(name, _select_utility_schemas(name, server, config), server.tool_timeout)
+    return _register_candidates(
+        name, _resolve_name_collisions(name, candidates),
+        check_fn=_make_check_fn(name), scope=lambda: scope, lazy=False, key=key)
+
+
 def _write_schema_cache(name: str, server: "MCPServerTask", config: dict, should_register) -> None:
     """Write-through: persist the manifest so the next startup registers this server lazily (no spawn). Never raises."""
     try:

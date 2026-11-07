@@ -143,6 +143,36 @@ def _reregister_orphaned_adopters() -> None:
                 reset_hermes_home_override(home_token)
 
 
+def refresh_adopters(name: str, server) -> None:
+    """After the owner of a shared connection re-lists its tools, give every adopting profile the
+    new list under ITS home, secret scope and config. The owner's registration covers only its own
+    scope, so without this an adopter (e.g. a profile served by the dashboard chat) kept a stale list
+    — missing added tools — until it reloaded. Stale names are already gone from every scope."""
+    from pathlib import Path
+    from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools import mcp_tool_registration as _registration
+    from tools.mcp_tool_common import mcp_server_enabled
+    from tools.mcp_tool_config import _load_mcp_config
+    key = _registration._server_key_for_task(server)
+    for adopter in _registration.adopter_scopes(key):
+        home_token = secret_token = None
+        try:
+            home_token = set_hermes_home_override(adopter)
+            secret_token = set_secret_scope(build_profile_secret_scope(Path(adopter)), profile_home=adopter)
+            config = (_load_mcp_config() or {}).get(name)
+            if config is not None and mcp_server_enabled(config):
+                _registration.register_into_adopter_scope(name, server, config, key, adopter)
+        except Exception:
+            logger.warning("MCP server '%s': refreshing tools for adopting profile scope %s failed",
+                           name, adopter, exc_info=True)
+        finally:
+            if secret_token is not None:
+                reset_secret_scope(secret_token)
+            if home_token is not None:
+                reset_hermes_home_override(home_token)
+
+
 def shutdown_mcp_servers(*, scope: Optional[str] = None, names: Optional[set] = None,
                          timeout: float = 15.0):
     """Close MCP server connections (in parallel) and stop the background loop. Each server

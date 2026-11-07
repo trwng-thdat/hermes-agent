@@ -120,3 +120,22 @@ class TestToolsFingerprint:
         a = Tool(name="a", description="", inputSchema=schema)
         b = Tool(name="b", description="", inputSchema=schema)
         assert _tools_fingerprint([a, b]) == _tools_fingerprint([b, a])
+
+
+class TestAdoptersRefreshedAfterOwnerState:
+    @pytest.mark.asyncio
+    async def test_owner_registered_names_are_final_when_adopters_refresh(self):
+        registry = ToolRegistry()
+        server = _connected_server("hd", registry, [_tool("old_tool")])
+        server.session = SimpleNamespace(
+            list_tools=AsyncMock(return_value=SimpleNamespace(tools=[_tool("old_tool"), _tool("new_tool")])))
+        seen = []
+
+        def record(name, srv):
+            seen.append(set(srv._registered_tool_names))
+
+        with patch("tools.registry.registry", registry), \
+                patch("tools.mcp_tool_lifecycle.refresh_adopters", side_effect=record):
+            await server._discover_tools()
+
+        assert seen and "mcp__hd__new_tool" in seen[0]
