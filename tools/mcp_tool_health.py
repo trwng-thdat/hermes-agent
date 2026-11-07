@@ -170,6 +170,9 @@ class MCPServerHealthMixin:
         registered_names = _registration._register_server_tools(self.name, self, self._config)
         self._deregister_owned(old_tool_names - set(registered_names))
         self._registered_tool_names = registered_names
+        # Owner state is final before adopters re-register from it.
+        from tools import mcp_tool_lifecycle as _lifecycle
+        _lifecycle.refresh_adopters(self.name, self)
         new_tool_names = set(registered_names)
         changes = [f"{label}: {', '.join(sorted(names))}" for label, names in
                    (("added", new_tool_names - old_tool_names), ("removed", old_tool_names - new_tool_names)) if names]
