@@ -1527,6 +1527,11 @@ platform_toolsets:
 #     ~15s), otherwise idle tool calls hit an expired session and pay a slow
 #     reconnect. Stdio servers disable keepalive by default; set this explicitly
 #     to opt a stdio server in.
+#   tools_relist_interval: HTTP only. Safety-net tools/list cadence in seconds
+#     (default 300, floored at 30s, 0 disables). Checked on every keepalive
+#     after the interval elapses, so a missed tools/list_changed (dead stream,
+#     server restart) is picked up within about interval + keepalive_interval.
+#     Tools are also re-listed on every reconnect.
 #   lazy: register the server's tools from the on-disk schema cache at startup
 #     and only spawn/connect it on the first tool call (default: false). Saves
 #     one child process per server in processes that rarely call tools. Needs
