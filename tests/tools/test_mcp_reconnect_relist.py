@@ -201,6 +201,40 @@ class TestToolsFingerprint:
         assert _tools_fingerprint([a, b]) == _tools_fingerprint([b, a])
 
 
+class TestRefreshTimeout:
+    @pytest.mark.asyncio
+    async def test_stalled_list_releases_lock_and_keeps_the_session(self):
+        async def never_returns(*_args, **_kwargs):
+            await asyncio.Event().wait()
+
+        server = MCPServerTask("hd")
+        server._config = {"url": "https://x/mcp"}
+        server.session = SimpleNamespace(list_tools=never_returns)
+        with patch("tools.mcp_tool._TOOLS_LIST_TIMEOUT", 0.05):
+            await server._refresh_tools()
+
+        assert server._rpc_lock.locked() is False
+        assert not server._reconnect_event.is_set()
+        assert server._suspect_reason is None
+
+    @pytest.mark.asyncio
+    async def test_timeout_after_reconnect_leaves_fresh_session_alone(self):
+        server = MCPServerTask("hd")
+        server._config = {"url": "https://x/mcp"}
+        fresh = SimpleNamespace(list_tools=AsyncMock())
+
+        async def swap_then_stall(*_args, **_kwargs):
+            server.session = fresh
+            await asyncio.Event().wait()
+
+        server.session = SimpleNamespace(list_tools=swap_then_stall)
+        with patch("tools.mcp_tool._TOOLS_LIST_TIMEOUT", 0.05):
+            await server._refresh_tools()
+
+        assert server.session is fresh
+        assert not server._reconnect_event.is_set()
+
+
 class TestScheduleRelistIfDue:
     def _server(self, listed_ago: float) -> MCPServerTask:
         server = MCPServerTask("hd")
@@ -225,6 +259,57 @@ class TestScheduleRelistIfDue:
         server._pending_refresh_tasks.add(object())
         server._schedule_relist_if_due(300)
         server._schedule_tools_refresh.assert_not_called()
+
+
+class TestFailedRefreshBacksOff:
+    """A skipped or failed refresh counts as an attempt: the next re-list waits a full interval
+    instead of re-firing (and re-taking the RPC lock) on every keepalive wake."""
+
+    def _server(self, listed_ago: float) -> MCPServerTask:
+        server = MCPServerTask("hd")
+        server._config = {"url": "https://x/mcp"}
+        server._tools_listed_at = time.monotonic() - listed_ago
+        server._advertises_tools = lambda: True
+        return server
+
+    @pytest.mark.asyncio
+    async def test_timed_out_relist_is_not_due_again_immediately(self):
+        async def never_returns(*_args, **_kwargs):
+            await asyncio.Event().wait()
+
+        server = self._server(listed_ago=400)
+        server.session = SimpleNamespace(list_tools=never_returns)
+        assert server._tools_relist_due(300)
+        with patch("tools.mcp_tool._TOOLS_LIST_TIMEOUT", 0.05):
+            await server._refresh_tools()
+
+        assert not server._tools_relist_due(300)
+
+    @pytest.mark.asyncio
+    async def test_relist_skipped_without_session_is_not_due_again_immediately(self):
+        server = self._server(listed_ago=400)
+        server.session = None
+        await server._refresh_tools()
+
+        assert not server._tools_relist_due(300)
+
+    @pytest.mark.asyncio
+    async def test_failed_relist_is_not_due_again_immediately(self):
+        server = self._server(listed_ago=400)
+        server.session = SimpleNamespace(list_tools=AsyncMock(side_effect=RuntimeError("boom")))
+        with pytest.raises(RuntimeError):
+            await server._refresh_tools()
+
+        assert not server._tools_relist_due(300)
+
+    @pytest.mark.asyncio
+    async def test_failed_refresh_never_arms_relist_before_first_listing(self):
+        server = self._server(listed_ago=0)
+        server._tools_listed_at = 0.0
+        server.session = None
+        await server._refresh_tools()
+
+        assert server._tools_listed_at == 0.0
 
 
 class TestAdoptersRefreshedAfterOwnerState:

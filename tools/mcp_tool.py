@@ -249,6 +249,8 @@ _DEFAULT_KEEPALIVE_INTERVAL, _MIN_KEEPALIVE_INTERVAL = 180, 5
 # the worst case is interval + keepalive_interval. Configurable per server via
 # ``tools_relist_interval``; 0 disables it.
 _DEFAULT_TOOLS_RELIST_INTERVAL, _MIN_TOOLS_RELIST_INTERVAL = 300, 30
+# Upper bound for a full (paginated) tools/list refresh held under the RPC lock.
+_TOOLS_LIST_TIMEOUT = 60.0
 # One bounded cancellation cycle at final shutdown so resistant tasks cannot hang exit.
 _MCP_LOOP_DRAIN_TIMEOUT = 3.0
 # JSON-RPC 2.0 "method not found" (server without optional ``ping``); _ensure_mcp_sdk()
