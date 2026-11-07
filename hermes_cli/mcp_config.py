@@ -429,9 +429,9 @@ def _probe_single_server(
     if issues:
         raise ValueError("; ".join(issues))
 
-    from tools.mcp_tool_loop import _ensure_mcp_loop, _run_on_mcp_loop
+    from tools.mcp_tool_loop import _run_on_mcp_loop
     from tools.mcp_tool_discovery import _connect_server
-    from tools.mcp_tool_lifecycle import _stop_mcp_loop_if_idle
+    from tools.mcp_tool_lifecycle import _probe_mcp_loop
     from tools.mcp_tool_common import _parse_boolish
 
     config = _resolve_mcp_server_config(config)
@@ -448,7 +448,6 @@ def _probe_single_server(
     # surfacing as a retry that re-opens a second authorization against the same callback port.
     config["connect_timeout"] = connect_timeout
 
-    _ensure_mcp_loop()
     tools_found: List[Tuple[str, str, str]] = []
 
     async def _probe():
@@ -517,12 +516,12 @@ def _probe_single_server(
         finally:
             await server.shutdown()
 
-    try:
-        _run_on_mcp_loop(_probe(), timeout=connect_timeout + 10)
-    except BaseException as exc:
-        raise _redact_probe_exception(exc) from None
-    finally:
-        _stop_mcp_loop_if_idle()
+    # Concurrent probes share the MCP loop: only the last one out may stop it.
+    with _probe_mcp_loop():
+        try:
+            _run_on_mcp_loop(_probe(), timeout=connect_timeout + 10)
+        except BaseException as exc:
+            raise _redact_probe_exception(exc) from None
     return tools_found
 
 

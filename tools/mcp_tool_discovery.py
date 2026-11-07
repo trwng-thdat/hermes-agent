@@ -753,7 +753,6 @@ def probe_mcp_server_tools() -> Dict[str, List[tuple]]:
         enabled = {k: v for k, v in (_config._load_mcp_config() or {}).items() if mcp_server_enabled(v)}
     if not enabled:
         return {}
-    _loop._ensure_mcp_loop()
     result: Dict[str, List[tuple]] = {}
     probed_servers: List[_core.MCPServerTask] = []
 
@@ -770,12 +769,12 @@ def probe_mcp_server_tools() -> Dict[str, List[tuple]]:
             result[name] = [(t.name, getattr(t, "description", "") or "") for t in outcome._tools]
         await asyncio.gather(*(s.shutdown() for s in probed_servers), return_exceptions=True)
 
-    try:
-        _loop._run_on_mcp_loop(_probe_all, timeout=120)
-    except Exception as exc:
-        logger.debug("MCP probe failed: %s", exc)
-    finally:
-        _lifecycle._stop_mcp_loop_if_idle()
+    # Shares the loop with concurrent single-server probes: only the last one out may stop it.
+    with _lifecycle._probe_mcp_loop():
+        try:
+            _loop._run_on_mcp_loop(_probe_all, timeout=120)
+        except Exception as exc:
+            logger.debug("MCP probe failed: %s", exc)
     return result
 
 
