@@ -1,5 +1,7 @@
 """A reconnect re-lists tools and applies changes; a safety-net re-list runs on the keepalive cadence."""
 
+import asyncio
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -65,6 +67,7 @@ class TestReconnectRelist:
 
         register.assert_not_called()
         assert server._registered_tool_names == before
+        assert server._tools_listed_at > 0
 
 
     @pytest.mark.asyncio
@@ -104,6 +107,82 @@ def _caps(resources=None, prompts=None):
     return SimpleNamespace(capabilities=SimpleNamespace(tools=SimpleNamespace(), resources=resources, prompts=prompts))
 
 
+class TestToolsRelistInterval:
+    def _server(self, config: dict) -> MCPServerTask:
+        server = MCPServerTask("hd")
+        server._config = config
+        return server
+
+    def test_default_when_unset(self):
+        from tools.mcp_tool import _DEFAULT_TOOLS_RELIST_INTERVAL
+        assert self._server({"url": "https://x/mcp"})._tools_relist_interval() == _DEFAULT_TOOLS_RELIST_INTERVAL
+
+    def test_zero_disables(self):
+        assert self._server({"url": "https://x/mcp", "tools_relist_interval": 0})._tools_relist_interval() is None
+
+    def test_below_floor_is_clamped(self):
+        from tools.mcp_tool import _MIN_TOOLS_RELIST_INTERVAL
+        interval = self._server({"url": "https://x/mcp", "tools_relist_interval": 1})._tools_relist_interval()
+        assert interval == _MIN_TOOLS_RELIST_INTERVAL
+
+    @pytest.mark.parametrize("bad", ["not-a-number", "nan", "inf", float("nan"), float("inf")])
+    def test_invalid_falls_back_to_default_with_warning(self, bad, caplog):
+        from tools.mcp_tool import _DEFAULT_TOOLS_RELIST_INTERVAL
+        with caplog.at_level("WARNING", logger="tools.mcp_tool"):
+            interval = self._server({"url": "https://x/mcp", "tools_relist_interval": bad})._tools_relist_interval()
+        assert interval == _DEFAULT_TOOLS_RELIST_INTERVAL
+        assert sum("invalid tools_relist_interval" in r.message for r in caplog.records) == 1
+
+    def test_stdio_never_relists(self):
+        assert self._server({"command": "srv"})._tools_relist_interval() is None
+
+    def test_never_due_before_first_listing(self):
+        server = self._server({"url": "https://x/mcp"})
+        assert server._tools_relist_due(server._tools_relist_interval()) is False
+
+
+class TestKeepaliveSchedulesRelist:
+    async def _one_keepalive_cycle(self, task):
+        real_wait = asyncio.wait
+        cycles = {"n": 0}
+
+        async def fake_wait(tasks, timeout=None, return_when=None):
+            cycles["n"] += 1
+            if cycles["n"] == 1:
+                return set(), set(tasks)
+            task._shutdown_event.set()
+            return await real_wait(tasks, timeout=0.5, return_when=return_when or asyncio.FIRST_COMPLETED)
+
+        import tools.mcp_tool as mcp_mod
+        orig = mcp_mod.asyncio.wait
+        mcp_mod.asyncio.wait = fake_wait
+        try:
+            return await task._wait_for_lifecycle_event()
+        finally:
+            mcp_mod.asyncio.wait = orig
+
+    def _task(self, listed_ago: float) -> MCPServerTask:
+        task = MCPServerTask("hd")
+        task._config = {"url": "https://x/mcp"}
+        task.session = SimpleNamespace(list_tools=AsyncMock(), send_ping=AsyncMock())
+        task._tools_listed_at = time.monotonic() - listed_ago
+        return task
+
+    @pytest.mark.asyncio
+    async def test_due_relist_is_scheduled_after_healthy_keepalive(self):
+        task = self._task(listed_ago=10_000)
+        with patch.object(MCPServerTask, "_schedule_tools_refresh") as schedule:
+            assert await self._one_keepalive_cycle(task) == "shutdown"
+        schedule.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_relist_not_scheduled_before_interval(self):
+        task = self._task(listed_ago=1)
+        with patch.object(MCPServerTask, "_schedule_tools_refresh") as schedule:
+            assert await self._one_keepalive_cycle(task) == "shutdown"
+        schedule.assert_not_called()
+
+
 class TestToolsFingerprint:
     def test_description_change_under_same_name_is_detected(self):
         from mcp.types import Tool
@@ -120,6 +199,32 @@ class TestToolsFingerprint:
         a = Tool(name="a", description="", inputSchema=schema)
         b = Tool(name="b", description="", inputSchema=schema)
         assert _tools_fingerprint([a, b]) == _tools_fingerprint([b, a])
+
+
+class TestScheduleRelistIfDue:
+    def _server(self, listed_ago: float) -> MCPServerTask:
+        server = MCPServerTask("hd")
+        server._config = {"url": "https://x/mcp"}
+        server._tools_listed_at = time.monotonic() - listed_ago
+        server._advertises_tools = lambda: True
+        server._schedule_tools_refresh = MagicMock()
+        return server
+
+    def test_schedules_when_due(self):
+        server = self._server(listed_ago=400)
+        server._schedule_relist_if_due(300)
+        server._schedule_tools_refresh.assert_called_once()
+
+    def test_skips_when_not_due(self):
+        server = self._server(listed_ago=10)
+        server._schedule_relist_if_due(300)
+        server._schedule_tools_refresh.assert_not_called()
+
+    def test_skips_while_a_refresh_is_pending(self):
+        server = self._server(listed_ago=400)
+        server._pending_refresh_tasks.add(object())
+        server._schedule_relist_if_due(300)
+        server._schedule_tools_refresh.assert_not_called()
 
 
 class TestAdoptersRefreshedAfterOwnerState:

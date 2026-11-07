@@ -4,6 +4,7 @@ protocol negotiation and initial tool discovery. Split from tools/mcp_tool.py.""
 
 import logging
 import asyncio
+import time
 import os
 import urllib.parse
 import urllib.request
@@ -631,6 +632,7 @@ class MCPServerTransportMixin:
             # pre-outage list until the next notification.
             self._apply_tool_list(self._tools, "re-listed after reconnect", previous_tools)
             return
+        self._tools_listed_at = time.monotonic()
         with _core._lock:
             owned = [key for key, live in _core._servers.items() if live is self]
         if not owned and not self._ready.is_set():

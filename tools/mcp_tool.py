@@ -244,6 +244,11 @@ _STDIO_RESPAWN_WAIT_SEC = 15.0
 # smaller configured ``keepalive_interval``); stdio only opts in explicitly because local pipes
 # have no remote session TTL. The floor stops a tiny interval busy-looping.
 _DEFAULT_KEEPALIVE_INTERVAL, _MIN_KEEPALIVE_INTERVAL = 180, 5
+# Safety-net re-list for remote servers: a missed tools/list_changed (dead GET stream, server
+# restart between keepalives) is picked up at the first keepalive after this interval elapses, so
+# the worst case is interval + keepalive_interval. Configurable per server via
+# ``tools_relist_interval``; 0 disables it.
+_DEFAULT_TOOLS_RELIST_INTERVAL, _MIN_TOOLS_RELIST_INTERVAL = 300, 30
 # One bounded cancellation cycle at final shutdown so resistant tasks cannot hang exit.
 _MCP_LOOP_DRAIN_TIMEOUT = 3.0
 # JSON-RPC 2.0 "method not found" (server without optional ``ping``); _ensure_mcp_sdk()
@@ -317,7 +322,7 @@ class MCPServerTask(MCPServerRunMixin, MCPServerTransportMixin, MCPServerHealthM
         "_recycled_reason", "initialize_result", "_ping_unsupported", "_list_cache_meta",
         "_reconnect_retries", "_session_proven", "_was_parked", "_inflight_tasks", "_reconnecting",
         "_suspect_reason", "_teardown_race", "_permanent_grace_used", "_stdio_child_pids",
-        "_ever_connected", "_sse_fallback", "_park_reason", "_last_park_line",
+        "_ever_connected", "_sse_fallback", "_park_reason", "_last_park_line", "_tools_listed_at",
         "_registered_capabilities")
 
     def __init__(self, name: str):
@@ -399,6 +404,8 @@ class MCPServerTask(MCPServerRunMixin, MCPServerTransportMixin, MCPServerHealthM
         self.initialize_result: Optional[Any] = None
         # SEP-2549 cache hints from the last tools/list (ttl_ms, cache_scope).
         self._list_cache_meta: dict = {}
+        # Monotonic time of the last full tools/list; drives the safety-net re-list.
+        self._tools_listed_at: float = 0.0
         # Utility families (resources/prompts) advertised when tools were last registered.
         self._registered_capabilities: Optional[tuple] = None
         # Latched when ``ping`` returns -32601; keepalives then use list_tools. Reset per connect.
