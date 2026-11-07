@@ -1,11 +1,13 @@
 """MCP process lifecycle: stdio child PID tracking and orphan cleanup, graceful
 server shutdown and draining of the background MCP loop."""
 
+import contextlib
 import logging
 import asyncio
 import os
+import threading
 import time
-from typing import Dict, Optional
+from typing import Dict, Iterator, Optional
 from tools.mcp_tool_common import _core
 from tools import mcp_tool_loop as _loop
 
@@ -22,6 +24,17 @@ _orphan_stdio_pid_servers: Dict[int, str] = {}
 # grandchildren keep that PGID after the direct child exits, so killpg still reaches them.
 # Separate from _stdio_pids so the PGID survives the child's removal. Empty on Windows.
 _stdio_pgids: Dict[int, int] = {}
+# Probes (``_probe_single_server``, ``probe_mcp_server_tools``) share the process-global MCP loop
+# but are not registered in ``_servers``, so ``_stop_mcp_loop_if_idle`` alone would let the first
+# probe to finish stop the loop under a concurrent one (the dashboard probes several servers at
+# once): ``_probe_mcp_loop`` counts in-flight probes and lets only the last one out stop the loop.
+# Loop start and every idle stop happen under the same lock, so a stop never races a starting probe:
+# a probe entering while a stop is in progress waits for it, then ensures a fresh loop. The stop is
+# NOT split out of the lock on purpose — it ends by reaping every tracked stdio child
+# (``include_active=True``), which would kill the child of a probe that started on a new loop meanwhile.
+# Reentrant because ``_probe_mcp_loop`` calls ``_stop_mcp_loop_if_idle`` while holding it.
+_active_probes = 0
+_active_probes_lock = threading.RLock()
 
 
 def _snapshot_child_pids() -> set:
@@ -211,7 +224,10 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None, names: Optional[set] = 
         if not servers_snapshot:
             clear_selected_status()
         _clear_connect_cooldowns(None if wildcard else selected_status)
-    _loop._stop_mcp_loop(only_if_idle=not wildcard)
+    if wildcard:
+        _loop._stop_mcp_loop()  # process-wide shutdown: stop even under an in-flight probe
+    else:
+        _stop_mcp_loop_if_idle()
     # A removed subset still shares its profile's log with the remaining servers.
     # Full/profile shutdown must also release handles left by completed CLI/UI probes.
     if names is None:
@@ -302,8 +318,37 @@ def _kill_orphaned_mcp_children(include_active: bool = False, server_name: Optio
 def _stop_mcp_loop_if_idle() -> bool:
     """Stop the MCP loop only when no registered server still owns it. Probe paths create
     temporary MCPServerTasks not placed in ``_servers``; they may clean up an idle loop but
-    must not tear down the process-global loop under live agent tools."""
-    return _loop._stop_mcp_loop(only_if_idle=True)
+    must not tear down the process-global loop under live agent tools. In-flight probes are not in
+    ``_servers`` either, so they hold the loop too; only the wildcard ``shutdown_mcp_servers`` (process
+    exit) stops it regardless, by calling ``_stop_mcp_loop`` directly."""
+    with _active_probes_lock:
+        if _active_probes:
+            logger.debug("Leaving MCP event loop running; %d probe(s) in flight", _active_probes)
+            return False
+        return _loop._stop_mcp_loop(only_if_idle=True)
+
+
+@contextlib.contextmanager
+def _probe_mcp_loop() -> Iterator[None]:
+    """Hold the MCP loop for one probe: start it on enter; on exit stop it when idle, but only if
+    no other probe is still in flight. The stop runs under ``_active_probes_lock``, so a probe
+    entering meanwhile waits for it and then starts a fresh loop. Every probe path must use this
+    instead of calling ``_ensure_mcp_loop``/``_stop_mcp_loop_if_idle`` directly."""
+    global _active_probes
+    with _active_probes_lock:
+        _active_probes += 1
+        try:
+            _loop._ensure_mcp_loop()
+        except BaseException:
+            _active_probes -= 1
+            raise
+    try:
+        yield
+    finally:
+        with _active_probes_lock:
+            _active_probes -= 1
+            if _active_probes == 0:
+                _stop_mcp_loop_if_idle()
 
 
 async def _drain_mcp_loop_tasks(*, timeout: Optional[float] = None) -> None:
