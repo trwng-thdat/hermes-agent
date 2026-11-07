@@ -123,6 +123,50 @@ def _get_cron_job_sync(job_id: str, profile: Optional[str] = None):
     return _found(_call_cron_for_profile(_job_profile(job_id, profile), "get_job", job_id))
 
 
+_AUX_USAGE_INT_FIELDS = (
+    "api_calls", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens",
+)
+
+
+def _flush_in_process_token_counts(db) -> None:
+    """Drain queued token deltas held by this process's shared writer for ``db``'s store.
+
+    The queue lives on the writer SessionDB instance, so a fresh read-only handle has nothing
+    to flush; a cron run executing in this process (desktop/gateway ticker) writes through the
+    registry's shared generation instead. Deltas queued by another process are out of reach.
+    Never raises.
+    """
+    db_path = getattr(db, "db_path", None)
+    if db_path is None:
+        return
+    try:
+        from hermes_state_registry import borrow_live_shared_session_dbs
+
+        target = Path(db_path).resolve()
+        with borrow_live_shared_session_dbs() as shared:
+            for writer in shared:
+                writer_path = getattr(writer, "db_path", None)
+                if writer_path is not None and Path(writer_path).resolve() == target:
+                    writer.flush_token_counts()
+    except Exception:
+        _log.exception("Failed to flush token counts before listing cron runs")
+
+
+def _aux_usage_total(db, session_id: str) -> Optional[Dict[str, Any]]:
+    """Auxiliary LLM usage (compression, title, vision, review, ...) summed across tasks; None on error."""
+    total: Dict[str, Any] = {field: 0 for field in _AUX_USAGE_INT_FIELDS}
+    total["estimated_cost_usd"] = 0.0
+    try:
+        for usage in db.auxiliary_usage_by_task(session_id).values():
+            for field in _AUX_USAGE_INT_FIELDS:
+                total[field] += int(usage.get(field) or 0)
+            total["estimated_cost_usd"] += float(usage.get("estimated_cost_usd") or 0.0)
+    except Exception:
+        _log.exception("Failed to read auxiliary usage for cron run %s", session_id)
+        return None
+    return total
+
+
 def _list_cron_job_runs_sync(job_id: str, profile: Optional[str] = None, limit: int = 20):
     """Run sessions produced by a cron job, newest first.
 
@@ -147,11 +191,13 @@ def _list_cron_job_runs_sync(job_id: str, profile: Optional[str] = None, limit: 
 
     db = _open_session_db_for_profile(selected, read_only=True)
     try:
+        _flush_in_process_token_counts(db)
         runs = db.list_cron_job_runs(canonical, limit=limit_n, offset=0)
         now = time.time()
         for s in runs:
             s["is_active"] = s.get("ended_at") is None and (now - s.get("last_active", s.get("started_at", 0))) < 300
             s["archived"] = bool(s.get("archived"))
+            s["aux_usage"] = _aux_usage_total(db, s["id"])
             if selected:
                 s["profile"] = selected
         return {"runs": runs, "limit": limit_n}

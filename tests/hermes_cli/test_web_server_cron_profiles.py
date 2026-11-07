@@ -1111,6 +1111,109 @@ async def test_cron_run_history_resolves_the_jobs_owner_profile(isolated_profile
 
 
 @pytest.mark.asyncio
+async def test_cron_job_runs_attach_aux_usage_summed_across_tasks(isolated_profiles, monkeypatch, tmp_path):
+    """Aux LLM calls never touch the sessions row, so each run carries their cross-task total;
+    a run without aux rows gets zeros and a failed lookup degrades to None, not a failed list."""
+    job = _web_server_cron._call_cron_for_profile(
+        "worker_alpha", "create_job", prompt="usage", schedule="every 1h", name="aux-usage-runs",
+    )
+    run_ids = [f"cron_{job['id']}_{n}" for n in (3, 2, 1)]
+    aux_by_session = {
+        run_ids[0]: {
+            "compression": {
+                "api_calls": 2, "input_tokens": 1000, "output_tokens": 200, "cache_read_tokens": 50,
+                "cache_write_tokens": 10, "reasoning_tokens": 5, "estimated_cost_usd": 0.0125,
+            },
+            "title_generation": {
+                "api_calls": 1, "input_tokens": 300, "output_tokens": 20, "cache_read_tokens": 0,
+                "cache_write_tokens": 0, "reasoning_tokens": 0, "estimated_cost_usd": 0.0005,
+            },
+        },
+        run_ids[1]: {},
+    }
+
+    class _FakeRunsDB:
+        db_path = tmp_path / "state.db"
+
+        def list_cron_job_runs(self, job_id, limit=20, offset=0):
+            return [{"id": run_id, "started_at": 1.0} for run_id in run_ids]
+
+        def auxiliary_usage_by_task(self, session_id):
+            if session_id not in aux_by_session:
+                raise RuntimeError("usage table unavailable")
+            return aux_by_session[session_id]
+
+        def close(self):
+            pass
+
+    flushed = []
+
+    class _FakeWriter:
+        def __init__(self, db_path):
+            self.db_path = db_path
+
+        def flush_token_counts(self):
+            flushed.append(self.db_path)
+
+    import contextlib
+    import hermes_state_registry
+
+    @contextlib.contextmanager
+    def _borrow():
+        yield [_FakeWriter(tmp_path / "state.db"), _FakeWriter(tmp_path / "other.db")]
+
+    monkeypatch.setattr(hermes_state_registry, "borrow_live_shared_session_dbs", _borrow)
+    monkeypatch.setattr(_rt_cron, "_open_session_db_for_profile", lambda profile, *, read_only: _FakeRunsDB())
+
+    result = await _rt_cron.list_cron_job_runs(job["id"], profile="worker_alpha")
+    usage = {run["id"]: run["aux_usage"] for run in result["runs"]}
+
+    assert flushed == [tmp_path / "state.db"]
+    summed = usage[run_ids[0]]
+    assert summed == {
+        "api_calls": 3, "input_tokens": 1300, "output_tokens": 220, "cache_read_tokens": 50,
+        "cache_write_tokens": 10, "reasoning_tokens": 5, "estimated_cost_usd": pytest.approx(0.013),
+    }
+    assert all(isinstance(summed[k], int) for k in summed if k != "estimated_cost_usd")
+    assert usage[run_ids[1]] == {
+        "api_calls": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0,
+        "cache_write_tokens": 0, "reasoning_tokens": 0, "estimated_cost_usd": 0.0,
+    }
+    assert usage[run_ids[2]] is None
+
+
+@pytest.mark.asyncio
+async def test_cron_job_runs_survive_a_failing_token_flush(isolated_profiles, monkeypatch, tmp_path):
+    job = _web_server_cron._call_cron_for_profile(
+        "worker_alpha", "create_job", prompt="usage", schedule="every 1h", name="flush-fails",
+    )
+
+    class _FakeRunsDB:
+        db_path = tmp_path / "state.db"
+
+        def list_cron_job_runs(self, job_id, limit=20, offset=0):
+            return [{"id": f"cron_{job_id}_1", "started_at": 1.0}]
+
+        def auxiliary_usage_by_task(self, session_id):
+            return {}
+
+        def close(self):
+            pass
+
+    import hermes_state_registry
+
+    def _boom():
+        raise RuntimeError("registry unavailable")
+
+    monkeypatch.setattr(hermes_state_registry, "borrow_live_shared_session_dbs", _boom)
+    monkeypatch.setattr(_rt_cron, "_open_session_db_for_profile", lambda profile, *, read_only: _FakeRunsDB())
+
+    result = await _rt_cron.list_cron_job_runs(job["id"], profile="worker_alpha")
+    assert [run["id"] for run in result["runs"]] == [f"cron_{job['id']}_1"]
+    assert result["runs"][0]["aux_usage"]["api_calls"] == 0
+
+
+@pytest.mark.asyncio
 async def test_cron_job_mutations_resolve_the_owner_when_the_hint_is_another_profile(isolated_profiles):
     """#115345 sibling: the per-job get/pause/resume/delete calls carry the same ambient-profile
     hint as the run lookup. A hint that does not hold the job must resolve to the owner instead of
