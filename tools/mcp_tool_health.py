@@ -5,6 +5,7 @@ child liveness and stdio idle/lifetime recycling."""
 import asyncio
 import json
 import logging
+import math
 import time
 from typing import Iterable, Optional
 from tools.mcp_tool_errors import _is_method_not_found_error, _unwrap_exception_group
@@ -154,6 +155,7 @@ class MCPServerHealthMixin:
         unchanged (a re-list must not churn the registry generation or prompt cache).
         ``_registered_capabilities`` is None until the first registration, so a never-registered
         server never matches and always registers."""
+        self._tools_listed_at = time.monotonic()
         old_tool_names = set(self._registered_tool_names)
         previous = self._tools if previous_tools is None else previous_tools
         unchanged_caps = self._registered_capabilities == _registration._capability_signature(self)
@@ -182,6 +184,38 @@ class MCPServerHealthMixin:
         else:
             logger.info("MCP server '%s': %s %d tool(s) (schemas updated, same names)",
                         self.name, reason, len(self._registered_tool_names))
+
+    def _tools_relist_interval(self) -> Optional[float]:
+        """Parsed ``tools_relist_interval`` (None = disabled). Invalid values fall back to the default
+        with one warning, so a typo in config never breaks the keepalive loop."""
+        if not self._is_http():
+            return None
+        configured = self._config.get("tools_relist_interval")
+        try:
+            interval = float(_core._DEFAULT_TOOLS_RELIST_INTERVAL if configured is None else configured)
+            if not math.isfinite(interval):
+                raise ValueError(configured)
+        except (TypeError, ValueError):
+            logger.warning("MCP server '%s': invalid tools_relist_interval %r; using %ss",
+                           self.name, configured, _core._DEFAULT_TOOLS_RELIST_INTERVAL)
+            interval = float(_core._DEFAULT_TOOLS_RELIST_INTERVAL)
+        if interval <= 0:
+            return None
+        return max(interval, float(_core._MIN_TOOLS_RELIST_INTERVAL))
+
+    def _tools_relist_due(self, interval: Optional[float]) -> bool:
+        """True when the safety-net re-list *interval* (from :meth:`_tools_relist_interval`) has elapsed
+        since the last tools/list. Never due before the first listing or for tool-less servers."""
+        if interval is None or not self._tools_listed_at or not self._advertises_tools():
+            return False
+        return time.monotonic() - self._tools_listed_at >= interval
+
+    def _schedule_relist_if_due(self, interval: Optional[float]) -> None:
+        """Schedule the safety-net re-list when due, unless a refresh is already pending (a busy
+        server skips keepalives, so the loop checks this on every wake and must not pile them up)."""
+        if self._pending_refresh_tasks or not self._tools_relist_due(interval):
+            return
+        self._schedule_tools_refresh()
 
     async def _keepalive_probe(self) -> None:
         """Exercise the session; raise on a genuine connection failure. ``ping`` first (cheap,

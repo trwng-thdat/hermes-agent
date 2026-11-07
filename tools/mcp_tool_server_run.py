@@ -65,6 +65,7 @@ class MCPServerRunMixin:
         stdio does so only when explicitly configured. A keepalive failure triggers a reconnect.
         """
         is_http = self._is_http()
+        relist_interval = self._tools_relist_interval()
         configured = self._config.get("keepalive_interval")
         keepalive_interval = None
         if is_http or configured is not None:
@@ -130,6 +131,7 @@ class MCPServerRunMixin:
                 # Timeout — no lifecycle event fired. See #48069.
                 if self.session:
                     if self._rpc_lock.locked() or any(not t.done() for t in self._inflight_tasks):
+                        self._schedule_relist_if_due(relist_interval)
                         continue
                     try:
                         async with self._rpc_lock:
@@ -144,6 +146,7 @@ class MCPServerRunMixin:
                     # Survived a full keepalive interval: real proof of health.
                     # Clear the rapid-drop budget (#62212).
                     self._mark_session_proven()
+                    self._schedule_relist_if_due(relist_interval)
         finally:
             await self._cancel_waiters(*waiters)
         if self._shutdown_event.is_set():
