@@ -145,9 +145,35 @@ class MCPServerHealthMixin:
                 session = self.session
                 if session is None:
                     logger.debug("MCP server '%s': skipping dynamic tool refresh; session not connected", self.name)
+                    self._defer_next_relist()
                     return
-                new_mcp_tools = await _core._paginate_full_list(session.list_tools, "tools", self.name)
+                try:
+                    new_mcp_tools = await asyncio.wait_for(
+                        _core._paginate_full_list(session.list_tools, "tools", self.name),
+                        timeout=_core._TOOLS_LIST_TIMEOUT)
+                except (asyncio.TimeoutError, TimeoutError):
+                    new_mcp_tools = None
+                except BaseException:
+                    self._defer_next_relist()
+                    raise
+            if new_mcp_tools is None:
+                self._defer_next_relist()
+                # A stalled tools/list must not pin the RPC lock (tool calls queue behind it and the
+                # keepalive skips while it is held). Keep the current tools and do NOT force a
+                # reconnect: that would fail the calls queued behind the lock. A wedged session is
+                # caught by the keepalive's own timeout; the next re-list retries the refresh.
+                logger.warning("MCP server '%s': tools/list refresh timed out after %.0fs; keeping the "
+                               "current tools until the next re-list", self.name, _core._TOOLS_LIST_TIMEOUT)
+                return
             self._apply_tool_list(new_mcp_tools, "dynamically refreshed")
+
+    def _defer_next_relist(self) -> None:
+        """A refresh that was skipped or failed still counts as an attempt for the safety-net
+        re-list: without this ``_tools_listed_at`` stays put, the re-list is due again on every
+        keepalive wake, and each retry can hold the RPC lock for up to ``_TOOLS_LIST_TIMEOUT``.
+        Never arms the re-list before the first successful listing."""
+        if self._tools_listed_at:
+            self._tools_listed_at = time.monotonic()
 
     def _apply_tool_list(self, new_mcp_tools: list, reason: str, previous_tools: Optional[list] = None) -> None:
         """Reconcile the registry with a fresh ``tools/list`` result: drop stale names, re-register
