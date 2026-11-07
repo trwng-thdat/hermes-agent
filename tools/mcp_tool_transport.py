@@ -626,10 +626,11 @@ class MCPServerTransportMixin:
         ``_discover_and_register_server``). Outage handling may clear ``_ready`` and deregister stale tools;
         ownership via ``_servers`` authorizes publishing before readiness is restored so a revival (or a server
         retained after a recoverable initial failure) never comes back with zero tools."""
-        if self._registered_tool_names:
+        if self._registered_tool_names or self._registered_capabilities is not None:
             # Reconnect (server deploy, expired session): no tools/list_changed can reach us across a
             # restart, so the fresh discovery IS the change signal — apply it instead of keeping the
-            # pre-outage list until the next notification.
+            # pre-outage list until the next notification. A registered server whose filter kept zero
+            # tools (``_registered_capabilities`` set, no names) goes here too, so it is not re-registered.
             self._apply_tool_list(self._tools, "re-listed after reconnect", previous_tools)
             return
         self._tools_listed_at = time.monotonic()

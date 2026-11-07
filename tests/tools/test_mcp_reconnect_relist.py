@@ -329,3 +329,78 @@ class TestAdoptersRefreshedAfterOwnerState:
             await server._discover_tools()
 
         assert seen and "mcp__hd__new_tool" in seen[0]
+
+
+def _zero_tool_server(registry: ToolRegistry) -> MCPServerTask:
+    """A registered server whose ``tools.include: []`` filter keeps none of its tools."""
+    server = MCPServerTask("hd")
+    server._config = {"url": "https://example.test/mcp", "tools": {"include": []}}
+    server.initialize_result = _caps()
+    server._tools = [_tool("hidden")]
+    server.session = SimpleNamespace(list_tools=AsyncMock(return_value=SimpleNamespace(tools=[_tool("hidden")])))
+    with patch("tools.registry.registry", registry):
+        server._registered_tool_names = _register_server_tools("hd", server, server._config)
+    assert server._registered_tool_names == []
+    server._ready.set()  # a live, ready server: the reconnect path would publish if it thought nothing was registered
+    return server
+
+
+class TestZeroToolServerRelist:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("relist", ["_refresh_tools", "_discover_tools"])
+    async def test_unchanged_relist_of_zero_tool_server_does_not_reregister(self, relist):
+        registry = ToolRegistry()
+        server = _zero_tool_server(registry)
+
+        with patch("tools.registry.registry", registry), \
+                patch("tools.mcp_tool_registration._register_server_tools") as register, \
+                patch("tools.mcp_tool_lifecycle.refresh_adopters") as refresh_adopters:
+            await getattr(server, relist)()
+
+        register.assert_not_called()
+        refresh_adopters.assert_not_called()
+        assert server._tools_listed_at > 0
+
+    @pytest.mark.asyncio
+    async def test_changed_relist_of_zero_tool_server_still_reregisters(self):
+        registry = ToolRegistry()
+        server = _zero_tool_server(registry)
+        server.session = SimpleNamespace(
+            list_tools=AsyncMock(return_value=SimpleNamespace(tools=[_tool("hidden"), _tool("also_hidden")])))
+
+        with patch("tools.registry.registry", registry), \
+                patch("tools.mcp_tool_lifecycle.refresh_adopters") as refresh_adopters:
+            await server._refresh_tools()
+
+        refresh_adopters.assert_called_once()
+
+    def test_first_listing_registers_even_when_the_list_matches(self):
+        registry = ToolRegistry()
+        server = MCPServerTask("hd")
+        server._config = {"url": "https://example.test/mcp"}
+        server.initialize_result = _caps()
+        server._tools = [_tool("first")]
+        assert server._registered_capabilities is None
+
+        with patch("tools.registry.registry", registry), \
+                patch("tools.mcp_tool_lifecycle.refresh_adopters"):
+            server._apply_tool_list([_tool("first")], "initial", previous_tools=[_tool("first")])
+
+        assert server._registered_tool_names == ["mcp__hd__first"]
+        assert "mcp__hd__first" in registry.get_all_tool_names()
+
+    @pytest.mark.asyncio
+    async def test_reconnect_after_deregistration_registers_again(self):
+        registry = ToolRegistry()
+        server = _connected_server("hd", registry, [_tool("same")])
+        server.initialize_result = _caps()
+        server.session = SimpleNamespace(list_tools=AsyncMock(return_value=SimpleNamespace(tools=[_tool("same")])))
+
+        with patch("tools.registry.registry", registry):
+            server._deregister_tools()
+            assert server._registered_capabilities is None
+            server._ready.set()
+            await server._discover_tools()
+
+        assert server._registered_tool_names == ["mcp__hd__same"]
+        assert "mcp__hd__same" in registry.get_all_tool_names()
