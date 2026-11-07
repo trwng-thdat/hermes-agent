@@ -608,6 +608,7 @@ class MCPServerTransportMixin:
         self._ping_unsupported = False  # fresh transport: re-probe ``ping`` across the reconnect
         if self.session is None:
             return
+        previous_tools = self._tools
         if not self._advertises_tools():
             logger.info("MCP server '%s': does not advertise 'tools' capability — "
                         "skipping tools/list (prompts/resources remain available)", self.name)
@@ -617,14 +618,18 @@ class MCPServerTransportMixin:
                 self._list_cache_meta = {}
                 self._tools = await _core._paginate_full_list(
                     self.session.list_tools, "tools", self.name, cache_meta_out=self._list_cache_meta)
-        self._register_discovered_tools_if_needed()
+        self._register_discovered_tools_if_needed(previous_tools)
 
-    def _register_discovered_tools_if_needed(self) -> None:
+    def _register_discovered_tools_if_needed(self, previous_tools: Optional[list] = None) -> None:
         """Publish freshly discovered tools when none are registered (initial registration normally happens in
         ``_discover_and_register_server``). Outage handling may clear ``_ready`` and deregister stale tools;
         ownership via ``_servers`` authorizes publishing before readiness is restored so a revival (or a server
         retained after a recoverable initial failure) never comes back with zero tools."""
         if self._registered_tool_names:
+            # Reconnect (server deploy, expired session): no tools/list_changed can reach us across a
+            # restart, so the fresh discovery IS the change signal — apply it instead of keeping the
+            # pre-outage list until the next notification.
+            self._apply_tool_list(self._tools, "re-listed after reconnect", previous_tools)
             return
         with _core._lock:
             owned = [key for key, live in _core._servers.items() if live is self]
