@@ -60,6 +60,9 @@ _OI_LLM_SYSTEM = "llm.system"
 _OI_LLM_TOKENS_PROMPT = "llm.token_count.prompt"
 _OI_LLM_TOKENS_COMPLETION = "llm.token_count.completion"
 _OI_LLM_TOKENS_TOTAL = "llm.token_count.total"
+# Parts of the prompt count served from / written to the provider's prompt cache.
+_OI_LLM_TOKENS_CACHE_READ = "llm.token_count.prompt_details.cache_read"
+_OI_LLM_TOKENS_CACHE_WRITE = "llm.token_count.prompt_details.cache_write"
 _OI_TOOL_NAME = "tool.name"
 _OI_SESSION_ID = "session.id"
 _OI_USER_ID = "user.id"
@@ -337,7 +340,15 @@ class TraceState:
     step_no: int = 0
     step_context: Any = None
     seen_messages: int = 0
+    # Turn totals, summed over every API call of the turn. prompt_tokens includes the
+    # cached part (cache_read + cache_write); total = prompt + completion.
     total_tokens: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    # Root metadata set when the turn opened; the token summary is merged in at the end.
+    root_metadata: Dict[str, Any] = field(default_factory=dict)
     tool_count: int = 0
     tool_errors: int = 0
     started_at: float = field(default_factory=time.time)
@@ -439,13 +450,14 @@ def _start_root(task_key: str, *, project: str, tracer: Any, task_id: str, sessi
     if last_user is not None:
         _set_attr(span, _OI_INPUT_VALUE, _capture_text(user_text))
         _set_attr(span, _OI_INPUT_MIME, _MIME_TEXT)
-    _set_metadata(span, {
+    root_metadata = {
         "source": "hermes", "profile": _profile_name(), "task_id": task_id, "turn_id": turn_id,
         "api_request_id": api_request_id, "platform": platform, "provider": provider, "model": model,
         "api_mode": api_mode, "project": project, "capture_mode": _capture_mode(),
-    })
+    }
+    _set_metadata(span, root_metadata)
     context = sdk["set_span_in_context"](span)
-    state = TraceState(project=project, root_span=span, context=context)
+    state = TraceState(project=project, root_span=span, context=context, root_metadata=root_metadata)
     # Step 1's input starts at the user message: the system prompt and history are the same for
     # every step, so they show once, as step 1's system message, not on every step.
     if isinstance(messages, list) and last_user is not None:
@@ -528,8 +540,16 @@ def _finish_trace(task_key: str, *, output: Any = None, error: bool = False, sta
             _set_attr(state.root_span, _OI_OUTPUT_MIME, _MIME_JSON)
         if state.total_tokens:
             _set_attr(state.root_span, _OI_LLM_TOKENS_TOTAL, state.total_tokens)
+        turn_tokens = _turn_token_summary(state)
+        for key, value in turn_tokens.items():
+            _set_attr(state.root_span, f"hermes.tokens.{key}", value)
+        if turn_tokens:
+            _set_metadata(state.root_span, {**state.root_metadata, **{f"tokens_{k}": v for k, v in turn_tokens.items()}})
         errors = f" ({state.tool_errors} lỗi)" if state.tool_errors else ""
-        tokens = f" · {state.total_tokens} tok" if state.total_tokens else ""
+        tokens = ""
+        if state.total_tokens:
+            cache = f", cache {turn_tokens['cache']} ({turn_tokens['cache_hit_pct']}%)" if turn_tokens.get("cache") else ""
+            tokens = f" · {state.total_tokens} tok{cache}"
         _set_attr(state.root_span, "hermes.summary",
                   f"{state.step_no} bước · {state.tool_count} tool{errors} · "
                   f"{round(time.time() - state.started_at, 1)}s{tokens}")
@@ -547,35 +567,71 @@ def _mark_error(span: Any, message: str) -> None:
 
 
 # ── token usage extraction ────────────────────────────────────────────────────
+def _num(src: Any, *names: str) -> int:
+    for n in names:
+        v = src.get(n) if isinstance(src, dict) else getattr(src, n, None)
+        if isinstance(v, (int, float)) and v:
+            return int(v)
+    return 0
+
+
 def _extract_tokens(response: Any, usage: Any) -> Dict[str, int]:
-    """(prompt, completion, total) tokens from a response object's ``.usage`` or a
-    summary ``usage`` dict. Handles both input/output and prompt/completion naming."""
-    src: Any = None
-    if getattr(response, "usage", None) is not None:
-        src = response.usage
-    elif isinstance(usage, dict) and usage:
-        src = usage
+    """OpenInference token counts for one API call: prompt (cached part included),
+    completion, total, and the prompt's cache_read / cache_write parts.
 
-    def _get(*names: str) -> int:
-        for n in names:
-            v = src.get(n) if isinstance(src, dict) else getattr(src, n, None)
-            if isinstance(v, (int, float)) and v:
-                return int(v)
-        return 0
-
-    if src is None:
+    Prefers Hermes's canonical ``usage`` summary (post_api_request): there
+    ``input_tokens`` is the UNCACHED input only, with cache reads/writes in their
+    own buckets. Falls back to a raw ``response.usage`` (OpenAI ``prompt_tokens``
+    already includes ``prompt_tokens_details.cached_tokens``; Anthropic reports
+    ``cache_read_input_tokens`` / ``cache_creation_input_tokens`` beside input)."""
+    if isinstance(usage, dict) and usage:
+        cache_read = _num(usage, "cache_read_tokens")
+        cache_write = _num(usage, "cache_write_tokens")
+        completion = _num(usage, "output_tokens", "completion_tokens")
+        prompt = _num(usage, "prompt_tokens") or (_num(usage, "input_tokens") + cache_read + cache_write)
+    elif getattr(response, "usage", None) is not None:
+        raw = response.usage
+        details = raw.get("prompt_tokens_details") if isinstance(raw, dict) else getattr(raw, "prompt_tokens_details", None)
+        completion = _num(raw, "output_tokens", "completion_tokens")
+        if _num(raw, "prompt_tokens"):  # OpenAI shape: cache is inside prompt_tokens
+            prompt = _num(raw, "prompt_tokens")
+            cache_read = _num(details, "cached_tokens") if details is not None else 0
+            cache_write = _num(details, "cache_write_tokens") if details is not None else 0
+        else:  # Anthropic shape: cache sits beside input_tokens
+            cache_read = _num(raw, "cache_read_input_tokens")
+            cache_write = _num(raw, "cache_creation_input_tokens")
+            prompt = _num(raw, "input_tokens") + cache_read + cache_write
+    else:
         return {}
-    prompt = _get("input_tokens", "prompt_tokens")
-    completion = _get("output_tokens", "completion_tokens")
-    total = _get("total_tokens") or (prompt + completion)
-    out: Dict[str, int] = {}
+
+    total = prompt + completion
+    if not total:
+        return {}
+    out: Dict[str, int] = {_OI_LLM_TOKENS_TOTAL: total}
     if prompt:
         out[_OI_LLM_TOKENS_PROMPT] = prompt
+        out[_OI_LLM_TOKENS_CACHE_READ] = cache_read
+        out[_OI_LLM_TOKENS_CACHE_WRITE] = cache_write
     if completion:
         out[_OI_LLM_TOKENS_COMPLETION] = completion
-    if total:
-        out[_OI_LLM_TOKENS_TOTAL] = total
     return out
+
+
+def _turn_token_summary(state: "TraceState") -> Dict[str, int]:
+    """The turn's token totals for the root span: total, the cached part (read +
+    write) and its share of the prompt, plus the uncached input and the output."""
+    if not state.total_tokens:
+        return {}
+    cache = state.cache_read_tokens + state.cache_write_tokens
+    return {
+        "total": state.total_tokens,
+        "cache": cache,
+        "cache_read": state.cache_read_tokens,
+        "cache_write": state.cache_write_tokens,
+        "input": max(0, state.prompt_tokens - cache),
+        "output": state.completion_tokens,
+        "cache_hit_pct": round(state.cache_read_tokens * 100 / state.prompt_tokens) if state.prompt_tokens else 0,
+    }
 
 
 def _serialize_assistant(assistant_message: Any, assistant_response: Any,
@@ -866,6 +922,10 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
     sdk = _load_sdk()
     with _STATE_LOCK:
         state.total_tokens += tokens.get(_OI_LLM_TOKENS_TOTAL, 0)
+        state.prompt_tokens += tokens.get(_OI_LLM_TOKENS_PROMPT, 0)
+        state.completion_tokens += tokens.get(_OI_LLM_TOKENS_COMPLETION, 0)
+        state.cache_read_tokens += tokens.get(_OI_LLM_TOKENS_CACHE_READ, 0)
+        state.cache_write_tokens += tokens.get(_OI_LLM_TOKENS_CACHE_WRITE, 0)
         # Tools this step asked for nest under it.
         state.step_context = sdk["set_span_in_context"](generation) if sdk and output.get("tool_calls") else None
 
