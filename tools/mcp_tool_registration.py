@@ -391,6 +391,14 @@ def _write_schema_cache(name: str, server: "MCPServerTask", config: dict, should
         logger.debug("MCP schema cache write failed for '%s': %s", name, exc)
 
 
+def _capability_signature(server: "MCPServerTask") -> tuple:
+    """Utility families the server advertises (``None`` capabilities = legacy, all assumed)."""
+    advertised = getattr(getattr(server, "initialize_result", None), "capabilities", None)
+    if advertised is None:
+        return ("legacy",)
+    return tuple(f for f in ("resources", "prompts") if getattr(advertised, f, None) is not None)
+
+
 def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> List[str]:
     """Register a connected server's tools plus utilities (initial discovery and list_changed
     refresh); returns the names. Toolset aliases derive from the live registry, not
@@ -403,6 +411,7 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
     registered = _register_candidates(
         name, _resolve_name_collisions(name, candidates),
         check_fn=_make_check_fn(name), scope=lambda: _core._server_registry_scope(key), lazy=False, key=key)
+    server._registered_capabilities = _capability_signature(server)
     if registered:
         _write_schema_cache(name, server, config, should_register)
     return registered

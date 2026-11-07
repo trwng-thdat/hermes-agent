@@ -135,7 +135,6 @@ class MCPServerHealthMixin:
         if not self._advertises_tools():
             return  # tools/list would raise MCPError(-32601)
         async with self._refresh_lock:
-            old_tool_names = set(self._registered_tool_names)
             async with self._rpc_lock:
                 # Snapshot the session only once the RPC lock is held: run() resets self.session
                 # to None on every transport teardown (reconnect, backoff, park, cancel) outside
@@ -147,24 +146,39 @@ class MCPServerHealthMixin:
                     logger.debug("MCP server '%s': skipping dynamic tool refresh; session not connected", self.name)
                     return
                 new_mcp_tools = await _core._paginate_full_list(session.list_tools, "tools", self.name)
-            # Remove only stale names first — no nuke-and-repave: live turns may hold tool-call
-            # IDs pointing at existing handlers; in-place replacement avoids "not connected" races.
-            self._deregister_owned(old_tool_names - {mcp_prefixed_tool_name(self.name, tool.name) for tool in new_mcp_tools})
-            # Re-register; a raw name can become ambiguous after normalization without changing
-            # its normalized name, so also drop old entries the final registration no longer owns.
+            self._apply_tool_list(new_mcp_tools, "dynamically refreshed")
+
+    def _apply_tool_list(self, new_mcp_tools: list, reason: str, previous_tools: Optional[list] = None) -> None:
+        """Reconcile the registry with a fresh ``tools/list`` result: drop stale names, re-register
+        the rest. Synchronous, so atomic on the event loop. Skips re-registration when the list is
+        unchanged (a re-list must not churn the registry generation or prompt cache).
+        ``_registered_capabilities`` is None until the first registration, so a never-registered
+        server never matches and always registers."""
+        old_tool_names = set(self._registered_tool_names)
+        previous = self._tools if previous_tools is None else previous_tools
+        unchanged_caps = self._registered_capabilities == _registration._capability_signature(self)
+        if unchanged_caps and _tools_fingerprint(new_mcp_tools) == _tools_fingerprint(previous):
             self._tools = new_mcp_tools
-            registered_names = _registration._register_server_tools(self.name, self, self._config)
-            self._deregister_owned(old_tool_names - set(registered_names))
-            self._registered_tool_names = registered_names
-            new_tool_names = set(registered_names)
-            changes = [f"{label}: {', '.join(sorted(names))}" for label, names in
-                       (("added", new_tool_names - old_tool_names), ("removed", old_tool_names - new_tool_names)) if names]
-            if changes:
-                logger.warning("MCP server '%s': tools changed dynamically — %s. "
-                               "Verify these changes are expected.", self.name, "; ".join(changes))
-            else:
-                logger.info("MCP server '%s': dynamically refreshed %d tool(s) (no changes)",
-                            self.name, len(self._registered_tool_names))
+            logger.debug("MCP server '%s': %s %d tool(s) (unchanged)", self.name, reason, len(old_tool_names))
+            return
+        # Remove only stale names first — no nuke-and-repave: live turns may hold tool-call
+        # IDs pointing at existing handlers; in-place replacement avoids "not connected" races.
+        self._deregister_owned(old_tool_names - {mcp_prefixed_tool_name(self.name, tool.name) for tool in new_mcp_tools})
+        # Re-register; a raw name can become ambiguous after normalization without changing
+        # its normalized name, so also drop old entries the final registration no longer owns.
+        self._tools = new_mcp_tools
+        registered_names = _registration._register_server_tools(self.name, self, self._config)
+        self._deregister_owned(old_tool_names - set(registered_names))
+        self._registered_tool_names = registered_names
+        new_tool_names = set(registered_names)
+        changes = [f"{label}: {', '.join(sorted(names))}" for label, names in
+                   (("added", new_tool_names - old_tool_names), ("removed", old_tool_names - new_tool_names)) if names]
+        if changes:
+            logger.warning("MCP server '%s': tools changed (%s) — %s. "
+                           "Verify these changes are expected.", self.name, reason, "; ".join(changes))
+        else:
+            logger.info("MCP server '%s': %s %d tool(s) (schemas updated, same names)",
+                        self.name, reason, len(self._registered_tool_names))
 
     async def _keepalive_probe(self) -> None:
         """Exercise the session; raise on a genuine connection failure. ``ping`` first (cheap,
@@ -293,3 +307,15 @@ class MCPServerHealthMixin:
         while not self._stdio_children_dead():
             # Async context — never block the loop (#36163).
             await asyncio.sleep(0.25)
+
+
+def _tools_fingerprint(tools: Iterable) -> str:
+    """Stable serialization of an MCP tool list (order-insensitive) for change detection."""
+    def _dump(tool):
+        dump = getattr(tool, "model_dump", None)
+        return dump(mode="json", exclude_none=True) if callable(dump) else {"name": getattr(tool, "name", None)}
+    try:
+        return json.dumps(sorted((_dump(t) for t in tools or []), key=lambda d: str(d.get("name"))),
+                          sort_keys=True, separators=(",", ":"), default=str)
+    except Exception:  # noqa: BLE001 — unknown shape: never report "unchanged"
+        return f"unserializable:{time.monotonic()}"
