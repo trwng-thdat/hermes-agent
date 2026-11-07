@@ -178,9 +178,10 @@ class MCPServerHealthMixin:
     def _apply_tool_list(self, new_mcp_tools: list, reason: str, previous_tools: Optional[list] = None) -> None:
         """Reconcile the registry with a fresh ``tools/list`` result: drop stale names, re-register
         the rest. Synchronous, so atomic on the event loop. Skips re-registration when the list is
-        unchanged (a re-list must not churn the registry generation or prompt cache).
-        ``_registered_capabilities`` is None until the first registration, so a never-registered
-        server never matches and always registers."""
+        unchanged (a periodic re-list must not churn the registry generation or prompt cache) — also
+        for a server whose filter registers zero tools. ``_registered_capabilities`` is None until the
+        first registration (and again after ``_deregister_tools``), so a never-registered server
+        never matches and always registers."""
         self._tools_listed_at = time.monotonic()
         old_tool_names = set(self._registered_tool_names)
         previous = self._tools if previous_tools is None else previous_tools

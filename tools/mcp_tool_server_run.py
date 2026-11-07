@@ -558,3 +558,5 @@ class MCPServerRunMixin:
         for tool_name in list(getattr(self, "_registered_tool_names", [])):
             _registration._deregister_mcp_tool_all_scopes(self, tool_name)
         self._registered_tool_names = []
+        # Nothing is registered any more: the next listing must register, not take the "unchanged" shortcut.
+        self._registered_capabilities = None
