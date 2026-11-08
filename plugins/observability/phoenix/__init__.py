@@ -27,6 +27,11 @@ or ``HERMES_PHOENIX_ENDPOINT`` is unset. Env:
     HERMES_PHOENIX_SERVICE_NAME   service.name resource attr (default hermes-agent)
     HERMES_PHOENIX_CAPTURE    metadata | sanitized (default) | full
     HERMES_PHOENIX_MAX_CHARS  max chars per captured field (default 12000)
+    HERMES_PHOENIX_INPUT      delta (default) | full — what an LLM step shows as its input:
+                              delta = only the messages new since the previous step;
+                              full  = the WHOLE request sent to the model (system prompt,
+                              replayed history, this turn), with a sectioned index in
+                              input.value and every message in llm.input_messages
     HERMES_PHOENIX_DEBUG      verbose plugin logging
 
 See README.md.
@@ -754,12 +759,25 @@ def _call_parts(tc: Any) -> tuple:
     return str(getattr(fn, "name", "") or ""), _parse_args(getattr(fn, "arguments", None))
 
 
-def _set_messages(span: Any, prefix: str, messages: list) -> None:
-    """OpenInference ``llm.{input,output}_messages`` so Phoenix renders a chat view."""
+def _set_messages(span: Any, prefix: str, messages: list, *, detailed: bool = False) -> None:
+    """OpenInference ``llm.{input,output}_messages`` so Phoenix renders a chat view.
+
+    ``detailed`` (full input mode) also records what the provider receives beyond the text:
+    a tool row's ``tool_call_id`` and tool name, and an assistant row's ``reasoning_content``
+    shown above its answer — the replayed reasoning is billed input too."""
+    names = _tool_call_labels(messages) if detailed else {}
     for i, msg in enumerate(messages):
         base = f"{prefix}.{i}.message"
         _set_attr(span, f"{base}.role", str(msg.get("role") or ""))
         text = _content_text(msg.get("content"))
+        if detailed:
+            reasoning = msg.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning.strip():
+                text = f"[reasoning_content · {len(reasoning)} chars]\n{reasoning}\n\n[content]\n{text}"
+            call_id = str(msg.get("tool_call_id") or "")
+            if call_id:
+                _set_attr(span, f"{base}.tool_call_id", call_id)
+                _set_attr(span, f"{base}.name", names.get(call_id) or str(msg.get("name") or ""))
         if text:
             _set_attr(span, f"{base}.content", _capture_text(text))
         for j, tc in enumerate(msg.get("tool_calls") or []):
@@ -784,6 +802,100 @@ def _input_digest(messages: list) -> str:
         elif text:
             rows.append(f"{'user' if role == 'user' else role}:\n{text}")
     return "\n\n".join(rows)
+
+
+_INPUT_MODES = ("delta", "full")
+
+
+def _input_mode() -> str:
+    value = _env("HERMES_PHOENIX_INPUT").lower()
+    return value if value in _INPUT_MODES else "delta"
+
+
+def _tool_call_labels(messages: list) -> Dict[str, str]:
+    """``tool_call_id`` → readable tool label (bridged ``tool_call`` unwrapped to its target)."""
+    labels: Dict[str, str] = {}
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        for tc in msg.get("tool_calls") or []:
+            call_id = str((tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", "")) or "")
+            name, args = _call_parts(tc)
+            if call_id:
+                labels[call_id] = _tool_label(name, args) or _short_tool(name)
+    return labels
+
+
+def _message_view(msg: dict, index: int, labels: Dict[str, str], new: bool) -> Dict[str, Any]:
+    """One request message as a readable JSON item: who, what, and its sizes."""
+    role = str(msg.get("role") or "")
+    text = _content_text(msg.get("content"))
+    item: Dict[str, Any] = {"#": index}
+    if new:
+        item["new"] = True
+    if role == "tool":
+        item["tool_result"] = labels.get(str(msg.get("tool_call_id") or "")) or str(msg.get("name") or "tool")
+        item["chars"] = len(text)
+        item["content"] = _capture_text(text)
+        return item
+    item[role or "message"] = _capture_text(text) if text else ""
+    reasoning = msg.get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning.strip():
+        item["reasoning"] = _capture_text(reasoning)
+        item["reasoning_chars"] = len(reasoning)
+    calls = []
+    for tc in msg.get("tool_calls") or []:
+        name, args = _call_parts(tc)
+        for target, target_args in _tool_targets(name, args) or [(name, args)]:
+            calls.append({"tool": _short_tool(target), "arguments": _deep_parse(target_args)})
+    if calls:
+        item["tool_calls"] = calls
+    return item
+
+
+def _full_input_view(messages: list, new_from: int) -> Dict[str, Any]:
+    """The WHOLE request as sections: overview / system prompt / conversation history / this turn.
+
+    History is grouped into turns, each opened by its user message. Everything after the last user
+    message is this turn. What the runtime replays from earlier turns — cleared tool output,
+    reasoning pads — shows exactly as sent. ``new`` marks messages added since the previous step."""
+    labels = _tool_call_labels(messages)
+    last_user = max((i for i, m in enumerate(messages) if m.get("role") == "user"), default=len(messages))
+    system_parts, history, this_turn = [], [], []
+    for i, msg in enumerate(messages):
+        role = msg.get("role")
+        if role == "system":
+            system_parts.append(_content_text(msg.get("content")))
+            continue
+        item = _message_view(msg, i, labels, new=i >= new_from)
+        if i >= last_user:
+            this_turn.append(item)
+        elif role == "user" or not history:
+            history.append({"turn": len(history) + 1, "messages": [item]})
+        else:
+            history[-1]["messages"].append(item)
+
+    def size(msg: dict) -> int:
+        return len(_content_text(msg.get("content"))) + len(str(msg.get("reasoning_content") or ""))
+
+    system_text = "\n\n".join(system_parts)
+    history_rows = [m for i, m in enumerate(messages) if m.get("role") != "system" and i < last_user]
+    turn_rows = [m for i, m in enumerate(messages) if m.get("role") != "system" and i >= last_user]
+    return {
+        "overview": {
+            "messages_sent": len(messages),
+            "system_prompt_chars": len(system_text),
+            "history_turns": len(history),
+            "history_chars": sum(size(m) for m in history_rows),
+            "history_reasoning_chars": sum(len(str(m.get("reasoning_content") or "").strip()) for m in history_rows),
+            "history_tool_result_chars": sum(size(m) for m in history_rows if m.get("role") == "tool"),
+            "this_turn_chars": sum(size(m) for m in turn_rows),
+            "new_since_previous_step": [i for i in range(new_from, len(messages))],
+        },
+        "system_prompt": _capture_text(system_text),
+        "conversation_history": history,
+        "this_turn": this_turn,
+    }
 
 
 def _decision(output: Dict[str, Any]) -> tuple:
@@ -861,7 +973,21 @@ def on_pre_llm_request(*, task_id: str = "", session_id: str = "", platform: str
         if span is not None:
             _set_attr(span, _OI_LLM_MODEL, model)
             _set_attr(span, _OI_LLM_PROVIDER, provider)
-            if isinstance(input_messages, list):
+            if isinstance(input_messages, list) and _input_mode() == "full":
+                # The whole request, every step: what the model actually received.
+                sent = [m for m in input_messages if isinstance(m, dict)]
+                new_from = state.seen_messages
+                if system_prompt and not any(m.get("role") == "system" for m in sent):
+                    sent = [{"role": "system", "content": str(system_prompt)}] + sent
+                    new_from += 1
+                state.seen_messages = len(input_messages)
+                _set_messages(span, "llm.input_messages", sent, detailed=True)
+                # JSON so Phoenix renders each section as its own collapsible block; every string
+                # leaf is capped on its own (_capture_text), so the document stays valid JSON.
+                view = _full_input_view(sent, new_from)
+                _set_attr(span, _OI_INPUT_VALUE, json.dumps(view, ensure_ascii=False, default=str, indent=2))
+                _set_attr(span, _OI_INPUT_MIME, _MIME_JSON)
+            elif isinstance(input_messages, list):
                 # Only what is new since the previous step; step 1 also carries the system prompt.
                 new = [m for m in input_messages[state.seen_messages:] if isinstance(m, dict)]
                 if state.step_no == 1 and system_prompt:

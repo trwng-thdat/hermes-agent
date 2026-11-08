@@ -140,3 +140,66 @@ def test_subagent_turn_nests_inside_the_parent_trace(spans):
     assert child_root.context.trace_id == root.context.trace_id  # one trace, not five separate ones
     assert by_name["1. Trả lời"].parent.span_id == child_root.context.span_id
     assert not phoenix._SUBAGENT_PARENTS
+
+
+# --- full input mode: every step shows the whole request ------------------------------------
+
+def _full_request():
+    bridged = {"id": "c1", "type": "function", "function": {
+        "name": "tool_call",
+        "arguments": json.dumps({"calls": [{"name": "mcp__helpdesk__search_customers", "arguments": {}}]})}}
+    return [
+        {"role": "system", "content": "SYS" * 10},
+        {"role": "user", "content": "cho tôi danh sách khách hàng"},
+        {"role": "assistant", "content": "", "tool_calls": [bridged], "reasoning_content": "need the list"},
+        {"role": "tool", "tool_call_id": "c1", "content": "[Tool output from an earlier turn cleared to save context.]"},
+        {"role": "assistant", "content": "Có 597 khách.", "reasoning_content": " "},
+        {"role": "user", "content": "có bao nhiêu pipeline?"},
+    ]
+
+
+def test_full_input_view_splits_system_history_and_this_turn():
+    view = phoenix._full_input_view(_full_request(), new_from=5)
+    assert list(view) == ["overview", "system_prompt", "conversation_history", "this_turn"]
+    assert view["system_prompt"] == "SYS" * 10
+    assert view["overview"]["history_turns"] == 1 and view["overview"]["new_since_previous_step"] == [5]
+    assert view["overview"]["history_reasoning_chars"] == len("need the list")  # the " " pad counts 0
+    turn = view["conversation_history"][0]
+    assert [list(m)[1] for m in turn["messages"]] == ["user", "assistant", "tool_result", "assistant"]
+    call = turn["messages"][1]
+    assert call["tool_calls"] == [{"tool": "helpdesk.search_customers", "arguments": {}}]
+    assert call["reasoning"] == "need the list"
+    assert turn["messages"][2]["tool_result"] == "helpdesk.search_customers"
+    assert "reasoning" not in turn["messages"][3]  # a blank pad is not shown as reasoning
+    assert view["this_turn"] == [{"#": 5, "new": True, "user": "có bao nhiêu pipeline?"}]
+
+
+def test_full_input_mode_shows_whole_request_every_step(spans, monkeypatch):
+    monkeypatch.setenv("HERMES_PHOENIX_INPUT", "full")
+    ids = dict(task_id="t2", session_id="s2", turn_id="u2", platform="tool")
+    request = _full_request()
+    phoenix.on_pre_llm_request(api_call_count=1, request_messages=request, **ids)
+    phoenix.on_post_llm_call(api_call_count=1, assistant_message=_msg("2 pipeline."), **ids)
+    phoenix.on_post_llm_call(assistant_response="2 pipeline.", **{k: ids[k] for k in ("task_id", "session_id", "turn_id")})
+
+    step = next(s for s in spans.get_finished_spans() if s.name.startswith("1."))
+    attrs = step.attributes
+    assert attrs["llm.input_messages.0.message.role"] == "system"
+    assert attrs["llm.input_messages.5.message.content"] == "có bao nhiêu pipeline?"  # all 6 sent rows
+    assert attrs["llm.input_messages.3.message.tool_call_id"] == "c1"
+    assert attrs["llm.input_messages.3.message.name"] == "helpdesk.search_customers"
+    assert attrs["llm.input_messages.2.message.content"].startswith("[reasoning_content · 13 chars]\nneed the list")
+    assert attrs["input.mime_type"] == "application/json"
+    view = json.loads(attrs["input.value"])
+    assert view["conversation_history"][0]["messages"][0]["user"] == "cho tôi danh sách khách hàng"
+    assert view["this_turn"][0]["user"] == "có bao nhiêu pipeline?"
+
+
+def test_delta_input_mode_is_the_default(spans, monkeypatch):
+    monkeypatch.delenv("HERMES_PHOENIX_INPUT", raising=False)
+    ids = dict(task_id="t3", session_id="s3", turn_id="u3", platform="tool")
+    phoenix.on_pre_llm_request(api_call_count=1, request_messages=_full_request(), system_prompt="SYS", **ids)
+    phoenix.on_post_llm_call(api_call_count=1, assistant_message=_msg("ok"), **ids)
+    phoenix.on_post_llm_call(assistant_response="ok", **{k: ids[k] for k in ("task_id", "session_id", "turn_id")})
+    step = next(s for s in spans.get_finished_spans() if s.name.startswith("1."))
+    assert "llm.input_messages.2.message.role" not in step.attributes  # system + this turn's user only
