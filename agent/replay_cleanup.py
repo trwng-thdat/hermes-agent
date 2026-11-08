@@ -168,7 +168,64 @@ def canonicalize_replay_history(
         now = time.time()
     cleaned = strip_interrupted_tool_tails(agent_history)
     cleaned = strip_dangling_tool_call_tail(cleaned)
-    return strip_stale_dangerous_confirmations(cleaned, now=now)
+    cleaned = strip_stale_dangerous_confirmations(cleaned, now=now)
+    return prune_replayed_tool_results(cleaned)
+
+
+# --- Prior-turn tool result pruning ---
+
+# Everything canonicalize_replay_history sees is replayed prefix: the send path passes only
+# the rows BEFORE the current turn's user message, and a resume restores finished turns. So
+# every tool result here belongs to a finished turn, and the turn that produced it already
+# answered from it. Re-sending a large result on every later call only buys cost, and the
+# system prompt tells the agent to re-call live tools anyway.
+#
+# Only the CONTENT is replaced: the assistant tool_calls (name + arguments) and the
+# tool_call_id pairing stay, so the history stays valid for every provider and the agent
+# can re-issue the exact call. Pruning a finished turn changes bytes only after that turn's
+# user message, which is the tail of the previous request — the cached prefix holds.
+# Results this short (an empty page, a count, an id) cost less than losing them.
+PRUNE_MIN_CHARS = 500
+# clarify carries the user's own answers; skill_view carries instructions a flow follows
+# across turns. Both are small next to data reads and costly to lose.
+_PRUNE_KEEP_TOOLS = frozenset({"clarify", "skill_view"})
+REPLAYED_TOOL_RESULT_PLACEHOLDER = (
+    "[Tool output from an earlier turn cleared to save context. Call the tool again if you need it.]"
+)
+
+
+def prune_replayed_tool_results(
+    agent_history: List[Dict[str, Any]], *, min_chars: int = PRUNE_MIN_CHARS
+) -> List[Dict[str, Any]]:
+    """Replace large tool results in replayed history with a short placeholder.
+
+    Results at or under ``min_chars``, non-string (multimodal) results, and results of
+    ``_PRUNE_KEEP_TOOLS`` are kept. Returns the same list object when nothing changes.
+    """
+    if not agent_history:
+        return agent_history
+    threshold = min_chars
+    call_names: Dict[str, str] = {}
+    pruned: Optional[List[Dict[str, Any]]] = None
+    for idx, msg in enumerate(agent_history):
+        if msg.get("role") == "assistant":
+            for call in msg.get("tool_calls") or []:
+                call_names[_call_id(call)] = _call_name(call)
+            continue
+        if msg.get("role") != "tool":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str) or len(content) <= threshold:
+            continue
+        if content == REPLAYED_TOOL_RESULT_PLACEHOLDER:
+            continue
+        name = call_names.get(str(msg.get("tool_call_id") or ""), "") or str(msg.get("name") or "")
+        if name in _PRUNE_KEEP_TOOLS:
+            continue
+        if pruned is None:
+            pruned = list(agent_history)
+        pruned[idx] = {**msg, "content": REPLAYED_TOOL_RESULT_PLACEHOLDER}
+    return agent_history if pruned is None else pruned
 
 
 # --- Stale dangerous-confirmation text expiry ---

@@ -215,3 +215,86 @@ def test_untrustworthy_confirmation_stamp_fails_closed():
         out = canonicalize_replay_history(row, now=10_000.0)
         assert "EXPIRED" in out[0]["content"] and "api_content" not in out[0], untrusted
     assert canonicalize_replay_history([{"role": "user", "content": "confirm reboot"}], now=1e9)[0]["content"] == "confirm reboot"
+
+
+# --- Prior-turn tool result pruning ---
+
+from agent.replay_cleanup import (
+    PRUNE_MIN_CHARS,
+    REPLAYED_TOOL_RESULT_PLACEHOLDER,
+    prune_replayed_tool_results,
+)
+
+
+def _call(call_id, name):
+    return {"id": call_id, "type": "function", "function": {"name": name, "arguments": '{"q": "x"}'}}
+
+
+def _turn_with_tools(text, results):
+    """A finished turn: user → assistant(tool_calls) → tool results → final answer."""
+    calls = [_call(call_id, name) for call_id, name, _ in results]
+    return [
+        _user(text),
+        {"role": "assistant", "content": "", "tool_calls": calls},
+        *[{"role": "tool", "tool_call_id": call_id, "content": content} for call_id, _, content in results],
+        {"role": "assistant", "content": f"answer to {text}"},
+    ]
+
+
+BIG = "x" * (PRUNE_MIN_CHARS * 4)
+
+
+def test_large_results_are_replaced_and_call_structure_kept():
+    history = _turn_with_tools("t1", [
+        ("a", "mcp__helpdesk__search_customers", BIG),
+        ("b", "mcp__helpdesk__list_tenants", "small result"),
+        ("c", "clarify", BIG),
+        ("d", "skill_view", BIG),
+    ])
+    frozen = copy.deepcopy(history)
+    out = prune_replayed_tool_results(history)
+
+    assert history == frozen  # input never modified
+    assert [m["role"] for m in out] == [m["role"] for m in history]
+    assert out[1]["tool_calls"] == history[1]["tool_calls"]  # names + arguments survive
+    contents = {m["tool_call_id"]: m["content"] for m in out if m["role"] == "tool"}
+    assert contents == {
+        "a": REPLAYED_TOOL_RESULT_PLACEHOLDER,
+        "b": "small result",
+        "c": BIG,  # the user's own answers
+        "d": BIG,  # instructions a flow follows across turns
+    }
+    assert prune_replayed_tool_results(out) is out  # idempotent
+
+
+def test_threshold_and_noop_return_the_same_list():
+    at_limit = _turn_with_tools("t1", [("a", "mcp__helpdesk__search_customers", "y" * PRUNE_MIN_CHARS)])
+    assert prune_replayed_tool_results(at_limit) is at_limit
+    history = _turn_with_tools("t1", [("a", "mcp__helpdesk__search_customers", BIG)])
+    assert prune_replayed_tool_results(history, min_chars=len(BIG)) is history
+
+
+def test_send_path_prunes_only_finished_turns_and_matches_resume_wire():
+    """Finished turns lose their large results; the live turn keeps every result on every
+    iteration; the resume replay and the send path emit the same bytes; and the next turn's
+    request extends the previous one past the pruned turn's user message (cache prefix)."""
+    turn1 = _turn_with_tools("t1", [("a", "mcp__helpdesk__search_customers", BIG)])
+    user2 = _user("t2")
+    live_rows = [
+        {"role": "assistant", "content": "", "tool_calls": [_call("b", "mcp__helpdesk__get_business_profile")]},
+        {"role": "tool", "tool_call_id": "b", "content": BIG},
+    ]
+    history = turn1 + [user2] + live_rows
+    request = _send(_SendAgent(), history, idx=len(turn1))
+
+    assert request[2]["content"] == REPLAYED_TOOL_RESULT_PLACEHOLDER  # turn 1, finished
+    assert request[-1]["content"] == BIG  # turn 2, live
+    replay = canonicalize_replay_history(turn1, now=10_000.0)
+    assert _wire(request[: len(turn1)]) == _wire(replay)
+
+    # Turn 2 finishes; turn 3 prunes it. Everything up to turn 2's user message is unchanged.
+    history += [{"role": "assistant", "content": "answer to t2"}, _user("t3")]
+    request3 = _send(_SendAgent(), history)
+    upto_user2 = len(turn1) + 1
+    assert _wire(request3[:upto_user2]) == _wire(request[:upto_user2])
+    assert request3[upto_user2 + 1]["content"] == REPLAYED_TOOL_RESULT_PLACEHOLDER
