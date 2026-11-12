@@ -181,6 +181,28 @@ COPY --from=node_source /usr/local/lib/node_modules/npm /usr/local/lib/node_modu
 RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
     ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 
+# ---------- Claude Code (AI-Claw Claude integration) ----------
+# AI-Claw delegates long documents, decks, images and videos to Claude Code
+# running in this container, signed in with the company's own Claude plan
+# (`claude auth login` from the AI-Claw UI; credentials live in
+# CLAUDE_CONFIG_DIR=/opt/data/.claude on the volume). The CLI itself is baked
+# here, outside the /opt/data volume overlay, so every VM gets it on an image
+# update instead of a manual install. Pinned and self-update disabled: the
+# install tree is root-owned and must not change under a running agent.
+#
+# /opt/claude-venv holds the Python libraries the generation prompts tell
+# Claude Code to use for .pptx / .docx (separate from the sealed Hermes venv).
+# Bump the versions here together with the AI-Claw backend if prompts change.
+ARG CLAUDE_CODE_VERSION=2.1.322
+ENV DISABLE_AUTOUPDATER=1
+RUN npm install -g --no-audit --fetch-retries=5 "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" && \
+    npm cache clean --force && \
+    claude --version && \
+    python3 -m venv /opt/claude-venv && \
+    /opt/claude-venv/bin/pip install --no-cache-dir \
+        python-pptx==1.0.2 python-docx==1.2.0 pillow==13.0.0 XlsxWriter==3.3.0 && \
+    /opt/claude-venv/bin/python -c "import pptx, docx, PIL, xlsxwriter"
+
 WORKDIR /opt/hermes
 
 # ---------- Layer-cached dependency install ----------
