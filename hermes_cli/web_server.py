@@ -396,6 +396,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Compress the large cron JSON routes; see hermes_cli/dashboard_gzip.py.
+from hermes_cli.dashboard_gzip import ScopedGZipMiddleware  # noqa: E402
+
+app.add_middleware(ScopedGZipMiddleware)
+
 # Endpoints that do NOT require the session token; everything else under /api/
 # is gated below. Shared with the OAuth gate so the two allowlists cannot
 # drift (/api/status once 401'd under the OAuth gate, breaking the portal probe).
