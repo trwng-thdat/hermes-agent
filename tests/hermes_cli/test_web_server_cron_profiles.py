@@ -1237,3 +1237,22 @@ async def test_cron_job_mutations_resolve_the_owner_when_the_hint_is_another_pro
     with pytest.raises(HTTPException) as exc:
         await _rt_cron.get_cron_job(job_id, profile="default")
     assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_list_cron_jobs_leaves_out_excluded_ids(isolated_profiles):
+    def make(profile, name):
+        return _web_server_cron._call_cron_for_profile(
+            profile, "create_job", prompt=f"{name} prompt", schedule="every 1h", name=name,
+        )
+
+    kept = make("default", "kept")
+    step_a = make("default", "[Workflow] step a")
+    step_b = make("worker_alpha", "[Workflow] step b")
+
+    jobs = await _rt_cron.list_cron_jobs(
+        profile="all", exclude_ids=f"{step_a['id']}, {step_b['id']},,unknown",
+    )
+
+    assert [job["id"] for job in jobs] == [kept["id"]]
+    assert len(await _rt_cron.list_cron_jobs(profile="all")) == 3

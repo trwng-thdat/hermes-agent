@@ -102,7 +102,27 @@ def _found(job):
     return job
 
 
-def _list_cron_jobs_sync(profile: str = "all"):
+# Cap on ids accepted by ``exclude_ids`` so one query string stays bounded.
+_LIST_EXCLUDE_IDS_MAX = 1000
+
+
+def _parse_exclude_ids(raw: Optional[str]) -> set:
+    if not raw:
+        return set()
+    ids = [part.strip() for part in raw.split(",") if part.strip()]
+    return set(ids[:_LIST_EXCLUDE_IDS_MAX])
+
+
+def _list_cron_jobs_sync(profile: str = "all", exclude_ids: Optional[str] = None):
+    # Claw keeps one hidden job per workflow step, each carrying a long prompt.
+    # It never shows them in the list, so it passes their ids to keep them out
+    # of the response instead of downloading and dropping them.
+    excluded = _parse_exclude_ids(exclude_ids)
+    jobs = _list_cron_jobs_for(profile)
+    return [job for job in jobs if job.get("id") not in excluded] if excluded else jobs
+
+
+def _list_cron_jobs_for(profile: str):
     requested = (profile or "all").strip()
     if requested.lower() != "all":
         return _call_cron_for_profile(requested, "list_jobs", True)
@@ -277,8 +297,8 @@ _CRON_FIRE_RETRY_AFTER_SECONDS = 60
 
 
 @router.get("/api/cron/jobs")
-async def list_cron_jobs(profile: str = "all"):
-    return await _run_cron_dashboard_io(_list_cron_jobs_sync, profile)
+async def list_cron_jobs(profile: str = "all", exclude_ids: Optional[str] = None):
+    return await _run_cron_dashboard_io(_list_cron_jobs_sync, profile, exclude_ids)
 
 
 @router.get("/api/cron/jobs/{job_id}")
