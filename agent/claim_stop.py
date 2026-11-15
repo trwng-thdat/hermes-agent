@@ -418,6 +418,28 @@ def _tool_evidence(texts: Any) -> str:
     return unicodedata.normalize("NFC", "\n".join(parts)).lower()
 
 
+# A status field a tool reported as finished ("status": "DONE"): a generic "hoàn tất" / "xong" /
+# "done" in the answer can be relaying that state from a read, not reporting a write of its own.
+_STATUS_KEYS = frozenset({"status", "state", "generationstatus", "jobstatus"})
+_DONE_STATUSES = frozenset({"done", "completed", "complete", "succeeded", "success", "finished"})
+
+
+def _done_status_reported(value: Any) -> bool:
+    if isinstance(value, str):
+        inner = _parse_json(value) if value.strip()[:1] in ("{", "[") else None
+        return inner is not None and _done_status_reported(inner)
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if str(key).lower() in _STATUS_KEYS and isinstance(item, str) and item.strip().lower() in _DONE_STATUSES:
+                return True
+            if _done_status_reported(item):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(_done_status_reported(item) for item in value)
+    return False
+
+
 def check_answer(
     agent: Any, messages: Sequence[Any], answer: str, start_idx: int,
 ) -> Optional[Tuple[str, Any]]:
@@ -426,6 +448,9 @@ def check_answer(
     if any(normalize_tool_name(name) in _SUBAGENT_TOOLS for _c, name, _t, _a in rows):
         return None  # the subagent's own writes are not in this transcript
     claims = find_claims(answer, _tool_evidence(text for _c, _n, text, _a in rows))
+    if claims and any(_done_status_reported(text) for _c, _n, text, _a in rows):
+        # Generic claims echo a finished status a tool reported; kind claims ("đã gửi") still need a write.
+        claims = [(sentence, kind) for sentence, kind in claims if kind]
     if not claims:
         return None
     receipts = turn_receipts(agent, messages, start_idx)

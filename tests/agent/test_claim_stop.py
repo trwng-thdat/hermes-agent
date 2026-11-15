@@ -284,6 +284,29 @@ def test_claim_of_another_action_is_unbacked():
     assert check_answer(_AGENT, messages, "Đã xoá tag VIP.", 0) == (UNBACKED_CLAIM, "Đã xoá tag VIP.")
 
 
+_GET_DOC = "mcp__jarvisclaw__claude_get_document"
+_DOC_DONE = json.dumps({"result": json.dumps({"id": "d1", "status": "DONE", "destination": "DRIVE", "url": "u"})})
+
+
+def test_generic_claim_relaying_a_read_done_status_passes():
+    # "thêm file này vào drive đi": the file is already on Drive; the answer relays its DONE status.
+    messages = _turn("thêm file này vào drive đi", ("c1", _GET_DOC, _DOC_DONE))
+    for answer in (
+        "Tài liệu đã hoàn tất và hiện đã nằm sẵn trên Drive (thư mục AI-Claw).",
+        "Mình đã kiểm tra lại tài liệu: trạng thái hiện là hoàn tất, nó đã ở trên Drive.",
+    ):
+        assert check_answer(_AGENT, messages, answer, 0) is None
+
+
+def test_done_status_does_not_back_a_specific_action_claim():
+    messages = _turn("thêm file này vào drive đi", ("c1", _GET_DOC, _DOC_DONE))
+    assert check_answer(_AGENT, messages, "Mình đã lưu tài liệu lên Drive.", 0)[0] == UNBACKED_CLAIM
+    # Without a DONE status a generic claim still needs a write.
+    pending = json.dumps({"result": json.dumps({"id": "d1", "status": "RUNNING"})})
+    messages = _turn("thêm file này vào drive đi", ("c1", _GET_DOC, pending))
+    assert check_answer(_AGENT, messages, "Tài liệu đã hoàn tất.", 0)[0] == UNBACKED_CLAIM
+
+
 def test_question_turn_answered_from_history_passes():
     messages = _turn("Đã gắn tag VIP cho khách Nam chưa?")
     assert check_answer(_AGENT, messages, "Đã gắn tag VIP cho khách Nam từ hôm qua.", 0) is None
