@@ -162,6 +162,29 @@ def normalize_tool_call_entries(args: Dict[str, Any]) -> Tuple[List[Dict[str, An
 _CALL_SHAPE = '{"calls":[{"name":"<exact tool name>","arguments":{...}}]}'
 
 
+def _loads_calls_string(raw: str) -> Any:
+    """Parse a stringified ``calls`` batch, repairing a dropped closing ``]``.
+
+    With long arguments, flash models stringify the batch and end it at the last
+    entry's ``}`` without the array's ``]``; the rest of the JSON is intact, so the
+    call fails 8 times in a row until the loop guard halts the turn (SCRUM-546).
+    Only that one repair is tried; anything else re-raises the original error.
+    """
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        text = raw.rstrip()
+        if text.startswith("[") and not text.endswith("]"):
+            try:
+                repaired = json.loads(text + "]")
+            except json.JSONDecodeError:
+                pass
+            else:
+                if isinstance(repaired, list):
+                    return repaired
+        raise
+
+
 def _normalize_entries(args: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     raw_calls = args.get("calls")
     if raw_calls is None:
@@ -173,7 +196,7 @@ def _normalize_entries(args: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Opti
         # Tolerate the model emitting the batch envelope as a JSON string —
         # mirror the per-entry `arguments` handling below (#114484).
         try:
-            raw_calls = json.loads(raw_calls)
+            raw_calls = _loads_calls_string(raw_calls)
         except json.JSONDecodeError as e:
             return [], f"tool_call 'calls' is not valid JSON: {e}"
     if isinstance(raw_calls, dict):

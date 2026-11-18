@@ -127,6 +127,27 @@ def test_normalize_parses_string_envelope_batch():
     assert entries == calls
 
 
+def test_normalize_repairs_string_envelope_missing_closing_bracket():
+    """SCRUM-546: a stringified batch that ends at the entry's ``}`` without ``]``
+    (seen 15/15 times from deepseek-v4.1-flash on long arguments) still parses."""
+    calls = [{"name": "mcp__helpdesk__add_crm_deal_note",
+              "arguments": {"deal_id": "deal_1", "body": "NHÁP BÁO GIÁ | Khách\nGói: Growth → 3.773.000/tháng"}}]
+    truncated = json.dumps(calls, ensure_ascii=False)[:-1] + "\n"
+    entries, err = normalize_tool_call_entries({"calls": truncated})
+    assert err is None
+    assert entries == calls
+
+
+@pytest.mark.parametrize("bad", [
+    '[{"name": "session_search", "arguments": {"query": "x"}',  # missing "}]" too: not repaired
+    '{"name": "session_search", "arguments": {"query": "x"}',  # a dict, not a batch
+])
+def test_normalize_does_not_repair_other_truncations(bad):
+    entries, err = normalize_tool_call_entries({"calls": bad})
+    assert entries == []
+    assert "not valid JSON" in err
+
+
 def test_normalize_parses_string_envelope_single_dict():
     """#114484: a stringified single dict normalizes to a batch of one."""
     entries, err = normalize_tool_call_entries(
